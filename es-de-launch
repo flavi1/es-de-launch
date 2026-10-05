@@ -1,0 +1,2280 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+es-de-launch — lance un jeu exactement comme ES-DE le ferait depuis son menu.
+
+    es-de-launch [OPTIONS] FICHIER
+    es-de-launch --info       FICHIER
+    es-de-launch --copy       FICHIER [--move] [--dry-run]
+    es-de-launch --output-cmd FICHIER
+    es-de-launch --init [--force]
+
+Configuration du lanceur : ~/.config/es-de-launch.conf (générée si absente).
+Cache : ~/.cache/es-de-launch (XML extraits de l'AppImage d'ES-DE, journaux).
+
+Dépendances : Python >= 3.8, bibliothèque standard uniquement.
+Optionnel : python-magic, ou la commande `file`, pour la détection MIME.
+"""
+
+import argparse
+import configparser
+import datetime
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+import zipfile
+import zlib
+
+VERSION = "0.1.0"
+
+# --------------------------------------------------------------------------
+# Codes de sortie (spec §2)
+# --------------------------------------------------------------------------
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_CONFIG = 3
+EXIT_SYSTEM = 4
+EXIT_EMULATOR = 5
+EXIT_CONFLICT = 6
+
+
+class LaunchError(Exception):
+    """Erreur attendue, avec un code de sortie."""
+
+    def __init__(self, message, code=EXIT_ERROR):
+        super().__init__(message)
+        self.code = code
+
+
+VERBOSE = False
+
+
+def log(msg):
+    if VERBOSE:
+        print("[es-de-launch] " + msg, file=sys.stderr)
+
+
+def warn(msg):
+    print("es-de-launch: attention : " + msg, file=sys.stderr)
+
+
+def expand(path):
+    if path is None:
+        return None
+    return os.path.expandvars(os.path.expanduser(path))
+
+
+def home():
+    return os.path.expanduser("~")
+
+
+def xdg_config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(home(), ".config")
+
+
+def xdg_cache_home():
+    return os.environ.get("XDG_CACHE_HOME") or os.path.join(home(), ".cache")
+
+
+# ==========================================================================
+# Lecture des fichiers XML d'ES-DE
+# ==========================================================================
+
+def parse_xml_lenient(path, root_tag="root"):
+    """Lit un XML qui peut ne pas avoir d'élément racine (es_settings.xml)."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    text = re.sub(r"<\?xml[^>]*\?>", "", text, count=1)
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError:
+        return ET.fromstring("<%s>%s</%s>" % (root_tag, text, root_tag))
+
+
+def parse_xml_file(path):
+    """ET.parse avec un message clair (code 3) si le fichier est mal formé."""
+    try:
+        return ET.parse(path).getroot()
+    except ET.ParseError as e:
+        raise LaunchError("XML invalide : %s (%s)" % (path, e), EXIT_CONFIG)
+    except OSError as e:
+        raise LaunchError("lecture impossible : %s (%s)" % (path, e), EXIT_CONFIG)
+
+
+def load_settings(config_dir):
+    """Réglages utiles d'es_settings.xml."""
+    settings = {"ROMDirectory": "", "CustomEventScripts": False}
+    path = os.path.join(config_dir, "settings", "es_settings.xml")
+    if not os.path.isfile(path):
+        log("es_settings.xml absent : réglages par défaut")
+    else:
+        try:
+            root = parse_xml_lenient(path)
+        except ET.ParseError as e:
+            raise LaunchError("XML invalide : %s (%s)" % (path, e), EXIT_CONFIG)
+        for el in root.iter():
+            name = el.get("name")
+            value = el.get("value")
+            if name is None or value is None:
+                continue
+            if el.tag == "bool":
+                settings[name] = value.lower() == "true"
+            else:
+                settings[name] = value
+    rom_dir = settings.get("ROMDirectory") or "~/ROMs"
+    settings["ROMDirectory"] = os.path.abspath(expand(rom_dir))
+    return settings
+
+
+class System:
+    def __init__(self, name):
+        self.name = name
+        self.fullname = name
+        self.path_raw = ""
+        self.path = ""
+        self.extensions = []
+        self.commands = []  # liste de (label, commande)
+        self.platforms = []
+        self.theme = ""
+        self.custom = False
+        self.order = 0
+
+    def accepts(self, ext, ignore_case=False):
+        if ignore_case:
+            return ext.lower() in (e.lower() for e in self.extensions)
+        return ext in self.extensions
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "fullname": self.fullname,
+            "path": self.path,
+            "platforms": self.platforms,
+            "extensions": self.extensions,
+            "commands": [label for label, _ in self.commands],
+        }
+
+
+def _parse_systems_file(path, custom):
+    root = parse_xml_file(path)
+    result = []
+    for el in root.findall("system"):
+        name = (el.findtext("name") or "").strip()
+        if not name:
+            continue
+        s = System(name)
+        s.custom = custom
+        s.fullname = (el.findtext("fullname") or name).strip()
+        s.path_raw = (el.findtext("path") or "").strip()
+        s.extensions = (el.findtext("extension") or "").split()
+        for i, c in enumerate(el.findall("command")):
+            label = c.get("label") or ("Commande %d" % (i + 1))
+            s.commands.append((label, (c.text or "").strip()))
+        s.platforms = [p.strip() for p in (el.findtext("platform") or "").split(",") if p.strip()]
+        s.theme = (el.findtext("theme") or "").strip()
+        result.append(s)
+    return result
+
+
+def load_systems(resources_dir, config_dir, rom_dir):
+    """Fusion custom_systems/es_systems.xml + es_systems.xml embarqué (spec §3)."""
+    bundled = os.path.join(resources_dir, "es_systems.xml")
+    if not os.path.isfile(bundled):
+        raise LaunchError("es_systems.xml introuvable dans %s" % resources_dir, EXIT_CONFIG)
+    systems = {}
+    order = []
+    custom = os.path.join(config_dir, "custom_systems", "es_systems.xml")
+    if os.path.isfile(custom):
+        for s in _parse_systems_file(custom, True):
+            if s.name not in systems:
+                systems[s.name] = s
+                order.append(s.name)
+        log("systèmes personnalisés : %s" % ", ".join(order))
+    for s in _parse_systems_file(bundled, False):
+        if s.name not in systems:
+            systems[s.name] = s
+            order.append(s.name)
+    for i, name in enumerate(order):
+        s = systems[name]
+        s.order = i
+        p = s.path_raw.replace("%ROMPATH%", rom_dir)
+        s.path = os.path.abspath(expand(p)) if p else ""
+    return systems
+
+
+def load_find_rules(resources_dir, config_dir):
+    """Retourne (emulators, cores) : nom -> liste de (type, [entrées])."""
+    emulators, cores = {}, {}
+
+    def read(path, target_emu, target_core, override):
+        root = parse_xml_file(path)
+        for tag, target in (("emulator", target_emu), ("core", target_core)):
+            for el in root.findall(tag):
+                name = el.get("name")
+                if not name or (name in target and not override):
+                    continue
+                rules = []
+                for r in el.findall("rule"):
+                    entries = [(e.text or "").strip() for e in r.findall("entry") if (e.text or "").strip()]
+                    rules.append((r.get("type"), entries))
+                target[name] = rules
+
+    custom = os.path.join(config_dir, "custom_systems", "es_find_rules.xml")
+    if os.path.isfile(custom):
+        read(custom, emulators, cores, True)
+    bundled = os.path.join(resources_dir, "es_find_rules.xml")
+    if not os.path.isfile(bundled):
+        raise LaunchError("es_find_rules.xml introuvable dans %s" % resources_dir, EXIT_CONFIG)
+    read(bundled, emulators, cores, False)
+    return emulators, cores
+
+
+class Gamelist:
+    def __init__(self):
+        self.alt_emulator = None
+        self.games = {}  # chemin absolu -> dict
+
+    @staticmethod
+    def load(config_dir, system):
+        g = Gamelist()
+        path = os.path.join(config_dir, "gamelists", system.name, "gamelist.xml")
+        if not os.path.isfile(path):
+            return g
+        try:
+            root = parse_xml_lenient(path, "gameList")
+        except ET.ParseError as e:
+            warn("gamelist illisible (%s) : %s" % (path, e))
+            return g
+        for el in root.iter("alternativeEmulator"):
+            label = (el.findtext("label") or "").strip()
+            if label:
+                g.alt_emulator = label
+        for el in root.iter("game"):
+            rel = (el.findtext("path") or "").strip()
+            if not rel:
+                continue
+            if rel.startswith("./"):
+                full = os.path.join(system.path, rel[2:])
+            else:
+                full = expand(rel)
+            info = {child.tag: (child.text or "").strip() for child in el}
+            g.games[os.path.normpath(full)] = info
+        return g
+
+    def game(self, rom):
+        return self.games.get(os.path.normpath(rom))
+
+
+# ==========================================================================
+# Configuration du lanceur (es-de-launch.conf) — spec §3.2
+# ==========================================================================
+
+DEFAULT_CONF = {
+    "general": {"version": "1"},
+    "install": {
+        "type": "auto",
+        "executable": "",
+        "config_dir": "~/ES-DE",
+        "resources_dir": "auto",
+        "cache_dir": "",
+    },
+    "launch": {"scripts": "always", "ambiguity": "ask"},
+    "systems": {"priority": "", "exclude": ""},
+}
+
+
+def new_confparser():
+    cp = configparser.ConfigParser(interpolation=None, delimiters=("=",))
+    cp.optionxform = str  # garde la casse (types MIME, chemins)
+    return cp
+
+
+def default_conf_path():
+    return os.path.join(xdg_config_home(), "es-de-launch.conf")
+
+
+class Conf:
+    def __init__(self, cp=None, path=None):
+        self.cp = cp or new_confparser()
+        self.path = path
+        for section, values in DEFAULT_CONF.items():
+            if not self.cp.has_section(section):
+                self.cp.add_section(section)
+            for k, v in values.items():
+                if not self.cp.has_option(section, k):
+                    self.cp.set(section, k, v)
+        for section in ("extensions", "folders", "mime"):
+            if not self.cp.has_section(section):
+                self.cp.add_section(section)
+
+    @staticmethod
+    def load(path):
+        cp = new_confparser()
+        cp.read(path, encoding="utf-8")
+        known = set(DEFAULT_CONF) | {"extensions", "folders", "mime"}
+        for s in cp.sections():
+            if s not in known:
+                warn("section inconnue [%s] dans %s" % (s, path))
+        return Conf(cp, path)
+
+    def get(self, section, key, default=""):
+        return self.cp.get(section, key, fallback=default)
+
+    def list(self, section, key):
+        return [x.strip() for x in self.get(section, key).split(",") if x.strip()]
+
+    @property
+    def cache_dir(self):
+        c = self.get("install", "cache_dir")
+        return expand(c) if c else os.path.join(xdg_cache_home(), "es-de-launch")
+
+    def ext_priority(self, ext):
+        key = ext.lstrip(".")
+        for k in (key, key.lower()):
+            if self.cp.has_option("extensions", k):
+                return self.list("extensions", k)
+        return []
+
+    def folders(self):
+        return {os.path.abspath(expand(k)): v.strip() for k, v in self.cp.items("folders")}
+
+    def mime_overrides(self):
+        return {k: v.strip() for k, v in self.cp.items("mime")}
+
+
+# ==========================================================================
+# Détection de l'installation ES-DE — spec §3.1
+# ==========================================================================
+#
+# Types reconnus :
+#   appimage  exécutable AppImage (ressources dans l'image, extraites en cache)
+#   system    paquet de distribution : /usr/bin/es-de + /usr/share/es-de/resources
+#   local     compilation installée : <préfixe>/bin/es-de + <préfixe>/share/es-de/resources
+#   portable  binaire avec un dossier resources/ à côté
+#   flatpak   ressources dans <installation flatpak>/app/<id>/current/active/files/share/es-de
+#   snap      ressources dans /snap/<nom>/current/.../share/es-de
+#   manual    resources_dir fourni par l'utilisateur
+#
+# ROOT permet aux tests de simuler une arborescence complète (/usr, /var, /snap).
+
+ROOT = os.environ.get("ES_DE_LAUNCH_ROOT", "")
+RES_SUBDIR = os.path.join("es-de", "resources", "systems", "linux")
+SANDBOXED = ("flatpak", "snap")
+
+
+def _r(path):
+    """Chemin système, préfixé par ROOT (tests)."""
+    return ROOT + path if ROOT else path
+
+
+def has_resources(d):
+    return bool(d) and all(os.path.isfile(os.path.join(d, f)) for f in ("es_systems.xml", "es_find_rules.xml"))
+
+
+def is_appimage(path):
+    """Signature AppImage (« AI » + type à l'octet 8). Repli pour les runtimes non
+    standard : ELF contenant une image squashfs ou DwarFS, ou nom en .AppImage."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4 << 20)
+    except OSError:
+        return False
+    if head[:4] != b"\x7fELF":
+        return False
+    if head[8:10] == b"AI" and head[10] in (1, 2):
+        return True
+    if path.lower().endswith(".appimage"):
+        return True
+    return b"hsqs" in head[0x1000:] or b"DWARFS" in head[0x1000:]
+
+
+def classify_install(exe):
+    """(type, exécutable réel, dossier des ressources ou None pour une AppImage)."""
+    real = os.path.realpath(exe)
+    if is_appimage(real):
+        return "appimage", real, None
+    d = os.path.dirname(real)
+    portable = os.path.join(d, "resources", "systems", "linux")
+    if has_resources(portable):
+        return "portable", real, portable
+    prefix = os.path.dirname(d)
+    res = os.path.join(prefix, "share", RES_SUBDIR)
+    if prefix == _r("/usr"):
+        return "system", real, res
+    return "local", real, res
+
+
+def _sandbox_installs():
+    """Installations Flatpak et Snap, trouvées par leurs ressources (sans connaître l'identifiant)."""
+    out = []
+    flatpak_roots = [_r("/var/lib/flatpak"), os.path.join(home(), ".local", "share", "flatpak")]
+    for base in flatpak_roots:
+        for res in sorted(glob.glob(os.path.join(base, "app", "*", "current", "active", "files",
+                                                 "share", RES_SUBDIR))):
+            app_id = res[len(os.path.join(base, "app")) + 1:].split(os.sep)[0]
+            exe = os.path.join(base, "exports", "bin", app_id)
+            out.append({"type": "flatpak", "executable": exe if os.path.exists(exe) else "",
+                        "real": res, "resources_dir": res, "origin": "flatpak " + app_id})
+    for pattern in ("/snap/*/current/usr/share/", "/snap/*/current/share/"):
+        for res in sorted(glob.glob(_r(pattern) + RES_SUBDIR)):
+            name = res[len(_r("/snap/")):].split(os.sep)[0]
+            exe = _r("/snap/bin/" + name)
+            out.append({"type": "snap", "executable": exe if os.path.exists(exe) else "",
+                        "real": res, "resources_dir": res, "origin": "snap " + name})
+    return out
+
+
+def detect_install():
+    """Liste des installations candidates, la plus probable d'abord.
+    Chaque entrée : type, executable, real, resources_dir, origin, valid."""
+    candidates = []
+    seen = set()
+
+    def add(path, origin):
+        if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+            return
+        kind, real, res = classify_install(path)
+        if real in seen:
+            return
+        seen.add(real)
+        candidates.append({"type": kind, "executable": path, "real": real, "resources_dir": res,
+                           "origin": origin, "valid": kind == "appimage" or has_resources(res)})
+
+    # 1. ce que l'utilisateur lance réellement
+    add(shutil.which("es-de"), "PATH")
+    # 2. emplacements d'AppImage usuels (les mêmes que ceux des règles de recherche d'ES-DE)
+    for d in ("Applications", "AppImages", ".local/bin", "bin", ".local/share/applications"):
+        for pattern in ("es-de", "ES-DE*.AppImage", "es-de*.AppImage", "*ES-DE*", "*es-de*"):
+            for p in sorted(glob.glob(os.path.join(home(), d, pattern))):
+                add(p, "~/" + d)
+    # 3. paquets et compilations
+    for p in ("/usr/bin/es-de", "/usr/games/es-de", "/usr/local/bin/es-de", "/opt/es-de/es-de"):
+        add(_r(p), "standard")
+    # 4. bacs à sable
+    for c in _sandbox_installs():
+        if c["real"] not in seen:
+            seen.add(c["real"])
+            c["valid"] = True
+            candidates.append(c)
+    # les installations exploitables d'abord, en gardant l'ordre de découverte
+    candidates.sort(key=lambda c: not c["valid"])
+    return candidates
+
+
+def resources_from_log(config_dir):
+    """Dossier des XML tel qu'ES-DE l'a lu (es_log.txt), s'il est lisible directement.
+    Un chemin de bac à sable Flatpak (/app/...) est traduit vers l'hôte."""
+    logf = os.path.join(config_dir, "logs", "es_log.txt")
+    try:
+        with open(logf, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    found = re.findall(r'Parsing systems configuration file "([^"]+)/es_systems\.xml"', text)
+    if not found:
+        return None
+    d = found[-1]
+    if d.startswith("/tmp/.mount_"):
+        return None  # AppImage : montage temporaire
+    if has_resources(_r(d)):
+        return _r(d)
+    if d.startswith("/app/"):
+        for c in _sandbox_installs():
+            if c["type"] == "flatpak" and c["resources_dir"].endswith(d[len("/app"):]):
+                return c["resources_dir"]
+    return None
+
+
+def detect_config_dir():
+    """Dossier de données ES-DE : celui qui contient settings/es_settings.xml."""
+    candidates = [os.environ.get("ESDE_APPDATA_DIR"), os.path.join(home(), "ES-DE")]
+    for pattern in (".var/app/*/data/ES-DE", ".var/app/*/ES-DE", "snap/*/current/ES-DE", "snap/*/common/ES-DE"):
+        candidates += sorted(glob.glob(os.path.join(home(), pattern)))
+    candidates.append(os.path.join(home(), ".emulationstation"))
+    for d in candidates:
+        if d and os.path.isfile(os.path.join(d, "settings", "es_settings.xml")):
+            return d
+    return os.path.join(home(), "ES-DE")
+
+
+# ==========================================================================
+# Ressources embarquées dans l'AppImage — extraction et cache (spec §3.3)
+# ==========================================================================
+
+RES_FILES = ("es_systems.xml", "es_find_rules.xml")
+INTERNAL_CANDIDATES = (
+    "usr/share/es-de/resources/systems/linux",
+    "usr/bin/resources/systems/linux",
+)
+
+
+def internal_path_from_log(config_dir):
+    """Chemin interne lu dans es_log.txt ('Parsing systems configuration file ...')."""
+    logf = os.path.join(config_dir, "logs", "es_log.txt")
+    try:
+        with open(logf, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = None
+    for m in re.finditer(r'Parsing systems configuration file "([^"]+)/es_systems\.xml"', text):
+        pass
+    if not m:
+        return None
+    full = m.group(1)
+    mm = re.match(r"/tmp/\.mount_[^/]+/(.+)$", full)
+    return mm.group(1) if mm else None
+
+
+def exe_fingerprint(exe):
+    real = os.path.realpath(exe)
+    st = os.stat(real)
+    return {"executable": real, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def cache_is_valid(cache_res, exe):
+    """Valide si : fichiers présents, même exécutable/taille/date, et cache
+    créé après la dernière modification de l'exécutable."""
+    manifest = os.path.join(cache_res, "manifest.json")
+    try:
+        with open(manifest, encoding="utf-8") as fh:
+            m = json.load(fh)
+        fp = exe_fingerprint(exe)
+    except (OSError, ValueError):
+        return False
+    for f in RES_FILES:
+        if not os.path.isfile(os.path.join(cache_res, f)):
+            return False
+    if m.get("executable") != fp["executable"]:
+        log("cache invalide : exécutable différent")
+        return False
+    if m.get("size") != fp["size"] or m.get("mtime_ns") != fp["mtime_ns"]:
+        log("cache invalide : l'exécutable a changé")
+        return False
+    if os.stat(manifest).st_mtime_ns < fp["mtime_ns"]:
+        log("cache invalide : plus ancien que l'exécutable")
+        return False
+    return True
+
+
+def _copy_res_from(base, rel_paths, dest):
+    for rel in rel_paths:
+        src = os.path.join(base, rel)
+        if all(os.path.isfile(os.path.join(src, f)) for f in RES_FILES):
+            for f in RES_FILES:
+                shutil.copyfile(os.path.join(src, f), os.path.join(dest, f))
+            return rel
+    # dernier recours : recherche
+    for root, _dirs, files in os.walk(base):
+        if "es_systems.xml" in files and "es_find_rules.xml" in files and root.endswith("linux"):
+            for f in RES_FILES:
+                shutil.copyfile(os.path.join(root, f), os.path.join(dest, f))
+            return os.path.relpath(root, base)
+    return None
+
+
+def _extract_by_mount(appimage, rel_paths, dest, timeout=15):
+    """Méthode principale : --appimage-mount, copie, puis arrêt du montage."""
+    proc = subprocess.Popen([appimage, "--appimage-mount"], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], timeout)
+        if not ready:
+            raise LaunchError("--appimage-mount n'a pas répondu", EXIT_CONFIG)
+        mount = proc.stdout.readline().decode(errors="replace").strip()
+        log("AppImage montée sur %s" % mount)
+        if not mount or not os.path.isdir(mount):
+            raise LaunchError("point de montage invalide : %r" % mount, EXIT_CONFIG)
+        return _copy_res_from(mount, rel_paths, dest)
+    finally:
+        # on ne termine que notre propre processus de montage
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        proc.stdout.close()
+
+
+def _extract_by_extract(appimage, rel_paths, dest):
+    """Repli : --appimage-extract sur le chemin réel, dans un dossier temporaire."""
+    with tempfile.TemporaryDirectory(prefix="es-de-launch-") as tmp:
+        for rel in rel_paths:
+            for f in RES_FILES:
+                subprocess.run([appimage, "--appimage-extract", rel + "/" + f], cwd=tmp,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        for top in ("squashfs-root", "AppDir"):
+            base = os.path.join(tmp, top)
+            if os.path.isdir(base):
+                got = _copy_res_from(base, rel_paths, dest)
+                if got:
+                    return got
+    return None
+
+
+def extract_appimage_resources(appimage, cache_dir, config_dir=None, force=False):
+    """Retourne le dossier contenant es_systems.xml et es_find_rules.xml,
+    extraits de l'AppImage et mis en cache dans cache_dir/resources."""
+    cache_res = os.path.join(cache_dir, "resources")
+    if not force and cache_is_valid(cache_res, appimage):
+        log("ressources en cache : %s" % cache_res)
+        return cache_res
+    os.makedirs(cache_dir, exist_ok=True)
+    rel_paths = []
+    from_log = internal_path_from_log(config_dir) if config_dir else None
+    if from_log:
+        log("chemin interne lu dans es_log.txt : %s" % from_log)
+        rel_paths.append(from_log)
+    rel_paths += [p for p in INTERNAL_CANDIDATES if p not in rel_paths]
+
+    tmp = tempfile.mkdtemp(prefix="resources.", dir=cache_dir)
+    try:
+        got = None
+        errors = []
+        for method in (_extract_by_mount, _extract_by_extract):
+            try:
+                got = method(appimage, rel_paths, tmp)
+            except (LaunchError, OSError, subprocess.SubprocessError) as e:
+                errors.append("%s : %s" % (method.__name__, e))
+                got = None
+            if got:
+                break
+        if not got:
+            raise LaunchError("impossible d'extraire les XML de %s (%s). Utilisez --resources-dir."
+                              % (appimage, "; ".join(errors) or "fichiers introuvables"), EXIT_CONFIG)
+        m = exe_fingerprint(appimage)
+        m["internal_path"] = got
+        m["extracted_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        with open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(m, fh, indent=2)
+        if os.path.isdir(cache_res):
+            old = cache_res + ".old"
+            shutil.rmtree(old, ignore_errors=True)
+            os.replace(cache_res, old)
+            shutil.rmtree(old, ignore_errors=True)
+        os.replace(tmp, cache_res)
+        log("XML extraits de l'AppImage (%s) vers %s" % (got, cache_res))
+        return cache_res
+    finally:
+        if os.path.isdir(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ==========================================================================
+# Contexte : conf + installation + config ES-DE
+# ==========================================================================
+
+class Context:
+    def __init__(self, conf, config_dir, resources_dir, settings, systems, emulators, cores):
+        self.conf = conf
+        self.config_dir = config_dir
+        self.resources_dir = resources_dir
+        self.settings = settings
+        self.systems = systems
+        self.emulators = emulators
+        self.cores = cores
+
+    @property
+    def rom_dir(self):
+        return self.settings["ROMDirectory"]
+
+    def library_systems(self):
+        """Systèmes ayant un gamelist ou un dossier de ROMs non vide."""
+        out = []
+        for s in self.ordered_systems():
+            gl = os.path.join(self.config_dir, "gamelists", s.name, "gamelist.xml")
+            if os.path.isfile(gl) or (s.path and os.path.isdir(s.path) and os.listdir(s.path)):
+                out.append(s)
+        return out
+
+    def ordered_systems(self):
+        return sorted(self.systems.values(), key=lambda s: s.order)
+
+
+def resolve_resources(conf, args, config_dir):
+    """Dossier contenant es_systems.xml / es_find_rules.xml, et type d'installation.
+    Ordre : option, conf, installation déclarée dans la conf, journal d'ES-DE,
+    puis chaque installation détectée (la première exploitable gagne)."""
+    refresh = getattr(args, "refresh_cache", False)
+    if getattr(args, "resources_dir", None):
+        return os.path.abspath(expand(args.resources_dir)), "manual"
+    configured = conf.get("install", "resources_dir", "auto")
+    kind = conf.get("install", "type", "auto") or "auto"
+    if configured and configured != "auto":
+        return os.path.abspath(expand(configured)), (kind if kind != "auto" else "manual")
+    exe = expand(conf.get("install", "executable"))
+    tried = []
+    if exe and kind != "auto":
+        if not os.path.exists(exe):
+            warn("exécutable de la conf introuvable (%s) : détection automatique" % exe)
+        elif kind == "appimage" or is_appimage(os.path.realpath(exe)):
+            return extract_appimage_resources(exe, conf.cache_dir, config_dir, force=refresh), "appimage"
+        else:
+            k, _real, res = classify_install(exe)
+            if has_resources(res):
+                return res, k
+            tried.append("%s (%s) : pas de ressources dans %s" % (exe, k, res))
+    from_log = resources_from_log(config_dir)
+    if from_log:
+        log("ressources lues dans es_log.txt : %s" % from_log)
+        k = "flatpak" if "/flatpak/" in from_log else "snap" if "/snap/" in from_log else "system"
+        return from_log, k
+    for c in detect_install():
+        if c["type"] == "appimage":
+            try:
+                return extract_appimage_resources(c["executable"], conf.cache_dir, config_dir,
+                                                  force=refresh), "appimage"
+            except LaunchError as e:
+                tried.append("%s (appimage) : %s" % (c["executable"], e))
+        elif c["valid"]:
+            return c["resources_dir"], c["type"]
+        else:
+            tried.append("%s (%s) : pas de ressources dans %s" % (c["executable"], c["type"], c["resources_dir"]))
+    detail = ("\n  " + "\n  ".join(tried)) if tried else " aucune installation trouvée"
+    raise LaunchError("ressources ES-DE introuvables ; indiquez --resources-dir ou complétez "
+                      "[install] dans la conf.%s" % detail, EXIT_CONFIG)
+
+
+def build_context(conf, args):
+    config_dir = os.path.abspath(expand(args.config_dir or conf.get("install", "config_dir") or "~/ES-DE"))
+    if not os.path.isdir(config_dir):
+        raise LaunchError("dossier de données ES-DE introuvable : %s" % config_dir, EXIT_CONFIG)
+    resources, kind = resolve_resources(conf, args, config_dir)
+    if kind in SANDBOXED:
+        warn("installation %s : les commandes d'ES-DE sont prévues pour son bac à sable ; "
+             "le lancement depuis l'hôte peut différer" % kind)
+    settings = load_settings(config_dir)
+    systems = load_systems(resources, config_dir, settings["ROMDirectory"])
+    emulators, cores = load_find_rules(resources, config_dir)
+    log("config ES-DE : %s ; ressources : %s ; ROMs : %s" % (config_dir, resources, settings["ROMDirectory"]))
+    return Context(conf, config_dir, resources, settings, systems, emulators, cores)
+
+
+# ==========================================================================
+# Génération de la conf (--init)
+# ==========================================================================
+
+def generate_conf(path, args, force=False):
+    if os.path.exists(path) and not force:
+        raise LaunchError("%s existe déjà (utilisez --force)" % path, EXIT_USAGE)
+    found = detect_install()
+    config_dir = os.path.abspath(expand(args.config_dir)) if args.config_dir else detect_config_dir()
+    conf = Conf()
+    lines_others = []
+    if args.resources_dir:
+        conf.cp.set("install", "type", "manual")
+        conf.cp.set("install", "resources_dir", args.resources_dir)
+    elif found:
+        best = found[0]
+        if not best["valid"]:
+            warn("installation trouvée (%s) mais ressources absentes de %s"
+                 % (best["executable"], best["resources_dir"]))
+        conf.cp.set("install", "type", best["type"])
+        conf.cp.set("install", "executable", best["executable"])
+        if best["type"] != "appimage" and best["resources_dir"]:
+            conf.cp.set("install", "resources_dir", best["resources_dir"])
+        if best["type"] in SANDBOXED:
+            lines_others.append("# attention : installation %s, les commandes d'ES-DE visent son bac à sable"
+                                % best["type"])
+        for other in found[1:]:
+            lines_others.append("# autre installation trouvée : %s %s (%s)"
+                                % (other["type"], other["executable"] or other["resources_dir"],
+                                   "exploitable" if other["valid"] else "sans ressources"))
+    else:
+        warn("aucune installation ES-DE détectée ; complétez [install] à la main")
+        conf.cp.set("install", "type", "manual")
+    conf.cp.set("install", "config_dir", config_dir)
+
+    # Priorités : nécessitent la config ES-DE
+    try:
+        ns = argparse.Namespace(config_dir=config_dir, resources_dir=args.resources_dir, refresh_cache=False)
+        ctx = build_context(conf, ns)
+        lib = ctx.library_systems()
+
+        def count_games(s):
+            g = Gamelist.load(ctx.config_dir, s)
+            return len(g.games)
+        lib.sort(key=lambda s: (-count_games(s), s.order))
+        conf.cp.set("systems", "priority", ", ".join(s.name for s in lib))
+        ext_map = {}
+        for s in lib:
+            for e in s.extensions:
+                ext_map.setdefault(e.lstrip(".").lower(), [])
+                if s.name not in ext_map[e.lstrip(".").lower()]:
+                    ext_map[e.lstrip(".").lower()].append(s.name)
+        for e, names in sorted(ext_map.items()):
+            if len(names) > 1 and e:
+                conf.cp.set("extensions", e, ", ".join(names))
+    except LaunchError as e:
+        warn("priorités non générées : %s" % e)
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if os.path.exists(path):
+        shutil.copyfile(path, path + ".bak")
+    header = ["# Généré par es-de-launch --init le %s" % datetime.date.today().isoformat(),
+              "# [launch] scripts : always | auto (suit CustomEventScripts) | never",
+              "# [launch] ambiguity : ask | first | fail",
+              "# [extensions] ext = systèmes candidats, du plus au moins prioritaire",
+              "# [folders] /chemin/hors/bibliotheque = système",
+              "# [mime] type/mime = système"] + lines_others
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(header) + "\n\n")
+        conf.cp.write(fh)
+    conf.path = path
+    return conf
+
+
+def load_or_init_conf(args):
+    path = expand(args.conf) if args.conf else default_conf_path()
+    if os.path.isfile(path):
+        return Conf.load(path)
+    print("es-de-launch : %s absent, détection de l'installation..." % path, file=sys.stderr)
+    try:
+        conf = generate_conf(path, args)
+        print("es-de-launch : configuration écrite dans %s" % path, file=sys.stderr)
+        return conf
+    except OSError as e:
+        warn("impossible d'écrire %s (%s) : configuration en mémoire" % (path, e))
+        return Conf()
+
+
+# ==========================================================================
+# Détection du système — spec §4
+# ==========================================================================
+
+CERTAIN, PROBABLE, WEAK = 3, 2, 1
+LEVEL_NAMES = {CERTAIN: "certain", PROBABLE: "probable", WEAK: "faible"}
+
+# type MIME (shared-mime-info / libmagic) -> plateformes ES-DE
+MIME_PLATFORMS = {
+    "application/x-n64-rom": ["n64"],
+    "application/x-nes-rom": ["nes", "famicom"],
+    "application/x-fds-disk": ["fds"],
+    "application/x-gameboy-rom": ["gb"],
+    "application/x-gameboy-color-rom": ["gbc"],
+    "application/x-gba-rom": ["gba"],
+    "application/x-genesis-rom": ["genesis", "megadrive"],
+    "application/x-genesis-32x-rom": ["sega32x"],
+    "application/x-sms-rom": ["mastersystem"],
+    "application/x-gamegear-rom": ["gamegear"],
+    "application/x-nintendo-ds-rom": ["nds"],
+    "application/x-snes-rom": ["snes"],
+    "application/x-virtual-boy-rom": ["virtualboy"],
+    "application/x-gamecube-rom": ["gc"],
+    "application/x-wii-rom": ["wii"],
+    "application/x-nintendo-3ds-rom": ["n3ds"],
+    "application/x-atari-2600-rom": ["atari2600"],
+    "application/x-atari-7800-rom": ["atari7800"],
+    "application/x-atari-lynx-rom": ["atarilynx"],
+    "application/x-pc-engine-rom": ["pcengine"],
+    "application/x-neo-geo-pocket-rom": ["ngp"],
+    "application/x-neo-geo-pocket-color-rom": ["ngpc"],
+    "application/x-wonderswan-rom": ["wonderswan"],
+    "application/x-wonderswan-color-rom": ["wonderswancolor"],
+}
+
+GBA_LOGO = bytes.fromhex("24FFAE51699AA221")
+GB_LOGO = bytes.fromhex("CEED6666CC0D000B")
+
+
+def read_at(fh, offset, size):
+    fh.seek(offset)
+    return fh.read(size)
+
+
+def n64_byte_order(head):
+    if head[:4] == b"\x80\x37\x12\x40":
+        return "z64"
+    if head[:4] == b"\x37\x80\x40\x12":
+        return "v64"
+    if head[:4] == b"\x40\x12\x37\x80":
+        return "n64"
+    return None
+
+
+# ---- Lecteurs : fichier brut ou image PSP .cso décompressée à la demande ----
+
+HEAD_SIZE = 0x10400  # couvre l'en-tête SNES HiROM avec en-tête de copieur
+
+
+class FileReader:
+    def __init__(self, fh, size):
+        self.fh, self.size = fh, size
+
+    def read(self, offset, n):
+        if offset < 0 or offset >= self.size:
+            return b""
+        self.fh.seek(offset)
+        return self.fh.read(n)
+
+
+class CsoReader:
+    """Image PSP .cso (CISO v1/v2, blocs deflate). Lecture du contenu ISO décompressé."""
+
+    def __init__(self, fh):
+        h = read_at(fh, 0, 24)
+        if h[:4] != b"CISO" or struct.unpack("<I", h[4:8])[0] not in (0, 0x18):
+            raise ValueError("pas un CSO")
+        self.fh = fh
+        self.size = struct.unpack("<Q", h[8:16])[0]
+        self.bs = struct.unpack("<I", h[16:20])[0]
+        self.align = h[21]
+        if not self.bs or not self.size:
+            raise ValueError("CSO vide")
+
+    def _block(self, n):
+        a, b = struct.unpack("<II", read_at(self.fh, 24 + 4 * n, 8))
+        pos, end = (a & 0x7FFFFFFF) << self.align, (b & 0x7FFFFFFF) << self.align
+        raw = read_at(self.fh, pos, end - pos)
+        if a & 0x80000000:
+            return raw[:self.bs]
+        return zlib.decompressobj(-15).decompress(raw)[:self.bs]
+
+    def read(self, offset, n):
+        out = b""
+        while n > 0 and 0 <= offset < self.size:
+            data = self._block(offset // self.bs)[offset % self.bs:][:n]
+            if not data:
+                break
+            out += data
+            offset += len(data)
+            n -= len(data)
+        return out
+
+
+# ---- ISO 9660 minimal --------------------------------------------------------
+
+def _iso_layout(rd):
+    """(taille de secteur, décalage des données) si un volume ISO9660 est trouvé."""
+    for sector, data_off in ((2048, 0), (2352, 24), (2352, 16)):
+        if rd.read(16 * sector + data_off + 1, 5) == b"CD001":
+            return sector, data_off
+    return None
+
+
+def _iso_sector(rd, layout, lba, count=1):
+    sector, off = layout
+    return b"".join(rd.read((lba + i) * sector + off, 2048) for i in range(count))
+
+
+def iso_info(rd):
+    """Volume principal et répertoire racine : {'system_id', 'volume_id', 'files': {NOM: (lba, taille)}}."""
+    layout = _iso_layout(rd)
+    if not layout:
+        return None
+    pvd = _iso_sector(rd, layout, 16)
+    root = pvd[156:156 + 34]
+    lba = struct.unpack("<I", root[2:6])[0]
+    size = struct.unpack("<I", root[10:14])[0]
+    data = _iso_sector(rd, layout, lba, max(1, min(16, (size + 2047) // 2048)))
+    files, i = {}, 0
+    while i < len(data):
+        ln = data[i]
+        if ln == 0:
+            i = ((i // 2048) + 1) * 2048
+            continue
+        rec = data[i:i + ln]
+        if len(rec) < 34:
+            break
+        name = rec[33:33 + rec[32]].decode("ascii", "replace").split(";")[0].upper()
+        files[name] = (struct.unpack("<I", rec[2:6])[0], struct.unpack("<I", rec[10:14])[0])
+        i += ln
+    return {"layout": layout, "files": files,
+            "system_id": pvd[8:40].decode("ascii", "replace").strip(),
+            "volume_id": pvd[40:72].decode("ascii", "replace").strip()}
+
+
+def sniff_iso(rd):
+    info = iso_info(rd)
+    if info is None:
+        return None
+    files = info["files"]
+    if info["system_id"].startswith("PSP GAME") or "PSP_GAME" in files or "UMD_DATA.BIN" in files:
+        return (CERTAIN, ["psp"], "ISO9660 : PSP GAME")
+    if "PS3_GAME" in files or "PS3_DISC.SFB" in files:
+        return (CERTAIN, ["ps3"], "ISO9660 : PS3_GAME")
+    if "SYSTEM.CNF" in files:
+        f_lba, f_size = files["SYSTEM.CNF"]
+        cnf = _iso_sector(rd, info["layout"], f_lba)[:min(f_size, 2048)].decode("ascii", "replace")
+        if re.search(r"^\s*BOOT2\s*=", cnf, re.M):
+            return (CERTAIN, ["ps2"], "SYSTEM.CNF : BOOT2")
+        if re.search(r"^\s*BOOT\s*=", cnf, re.M):
+            return (CERTAIN, ["psx"], "SYSTEM.CNF : BOOT")
+    if "IPL.TXT" in files:
+        return (CERTAIN, ["neogeocd"], "ISO9660 : IPL.TXT (Neo Geo CD)")
+    if info["system_id"].startswith("PLAYSTATION"):
+        return (PROBABLE, ["psx", "ps2"], "ISO9660 : système PLAYSTATION")
+    return None
+
+
+# ---- Formats GameCube / Wii (y compris compressés) ---------------------------
+
+GC_MAGIC, WII_MAGIC = b"\xc2\x33\x9f\x3d", b"\x5d\x1c\x9e\xa3"
+
+
+def _disc_header_kind(dh):
+    if dh[0x1C:0x20] == GC_MAGIC:
+        return "gc"
+    if dh[0x18:0x1C] == WII_MAGIC:
+        return "wii"
+    return None
+
+
+def sniff_nintendo_disc(rd, head):
+    kind = _disc_header_kind(head)
+    if kind:
+        return (CERTAIN, [kind], "disque %s" % ("GameCube" if kind == "gc" else "Wii"))
+    if head[:4] in (b"RVZ\x01", b"WIA\x01"):
+        fmt = head[:3].decode()
+        dtype = struct.unpack(">I", head[0x48:0x4C])[0]
+        kind = {1: "gc", 2: "wii"}.get(dtype) or _disc_header_kind(head[0x58:0x58 + 0x80])
+        if kind:
+            return (CERTAIN, [kind], "%s : disque %s" % (fmt, "GameCube" if kind == "gc" else "Wii"))
+        return (PROBABLE, ["gc", "wii"], "conteneur %s" % fmt)
+    if head[:4] == b"\x01\xc0\x0b\xb1":  # GCZ (0xB10BC001, petit-boutiste)
+        sub = struct.unpack("<I", head[4:8])[0]
+        kind = {0: "gc", 1: "wii"}.get(sub)
+        if kind:
+            return (CERTAIN, [kind], "GCZ : disque %s" % ("GameCube" if kind == "gc" else "Wii"))
+    if head[:4] == b"CISO" and struct.unpack("<I", head[4:8])[0] not in (0, 0x18):
+        kind = _disc_header_kind(rd.read(0x8000, 0x20)) if rd else None
+        if kind:
+            return (CERTAIN, [kind], "CISO : disque %s" % ("GameCube" if kind == "gc" else "Wii"))
+    if head[:4] == b"WBFS":
+        if rd and rd.read(0x218, 4) == WII_MAGIC:
+            return (CERTAIN, ["wii"], "WBFS : disque Wii")
+        return (PROBABLE, ["wii"], "conteneur WBFS")
+    if head[:4] == b"\xae\x0f\x38\xa2":
+        return (CERTAIN, ["gc"], "TGC (GameCube)")
+    return None
+
+
+# ---- CHD (MAME) : métadonnées seulement, le contenu est compressé -------------
+
+CHD_TAGS = {b"CHGD": "GD-ROM", b"CHCD": "CD", b"CHTR": "CD", b"CHT2": "CD", b"DVD ": "DVD", b"GDDD": "disque dur"}
+
+
+def chd_kind(rd):
+    h = rd.read(0, 124)
+    if h[:8] != b"MComprHD":
+        return None
+    version = struct.unpack(">I", h[12:16])[0]
+    meta = struct.unpack(">Q", h[48:56] if version >= 5 else h[36:44])[0]
+    kinds = []
+    for _ in range(64):
+        if not meta:
+            break
+        entry = rd.read(meta, 16)
+        if len(entry) < 16:
+            break
+        kind = CHD_TAGS.get(entry[:4])
+        if kind and kind not in kinds:
+            kinds.append(kind)
+        meta = struct.unpack(">Q", entry[8:16])[0]
+    return version, kinds
+
+
+def sniff_chd(rd):
+    r = chd_kind(rd)
+    if r is None:
+        return None
+    version, kinds = r
+    label = "CHD v%d (%s)" % (version, ", ".join(kinds) or "type inconnu")
+    if "GD-ROM" in kinds:
+        return (PROBABLE, ["dreamcast", "arcade"], label)
+    if "DVD" in kinds:
+        return (PROBABLE, ["ps2", "psp"], label)
+    return ("INFO", None, label)  # CD : ne restreint pas les candidats
+
+
+# ---- Cartouches ---------------------------------------------------------------
+
+def snes_header(head, size):
+    """Valide l'en-tête interne SNES (LoROM ou HiROM, avec ou sans en-tête de copieur)."""
+    copier = 512 if size % 1024 == 512 else 0
+    for base in (0x7FC0, 0xFFC0):
+        h = head[base + copier:base + copier + 32]
+        if len(h) < 32:
+            continue
+        comp, chk = struct.unpack("<HH", h[0x1C:0x20])
+        title = h[:21]
+        if comp ^ chk == 0xFFFF and (h[0x15] & 0xE0) == 0x20 \
+                and all(32 <= c < 127 for c in title if c):
+            return "%s, « %s »" % ("HiROM" if base == 0xFFC0 else "LoROM", title.decode("ascii").strip())
+    return None
+
+
+def virtualboy_header(tail, size):
+    """En-tête Virtual Boy, 0x220 octets avant la fin d'une ROM de taille puissance de 2."""
+    if size < 0x10000 or size > 0x1000000 or size & (size - 1) or len(tail) < 0x220:
+        return None
+    h = tail[-0x220:]
+    maker, code = h[25:27], h[27:31]
+    if h[20:25] == b"\x00" * 5 and maker.isalnum() and code.isalnum():
+        return h[:20].split(b"\x00")[0].decode("shift_jis", "replace").strip() or code.decode()
+    return None
+
+
+def sniff_bytes(head, rd=None, size=0, tail=b""):
+    """Signatures d'en-tête. Retourne (niveau, [plateformes], méthode) ou None."""
+    def at(off, n):
+        return head[off:off + n]
+
+    size = size or len(head)
+    order = n64_byte_order(head)
+    if order:
+        return (PROBABLE, ["n64"], "en-tête N64 (%s)" % order)
+    if head[:4] == b"NES\x1a":
+        return (PROBABLE, ["nes", "famicom"], "en-tête iNES")
+    if head[:4] == b"FDS\x1a" or at(1, 14) == b"*NINTENDO-HVC*":
+        return (PROBABLE, ["fds"], "en-tête FDS")
+    r = sniff_nintendo_disc(rd, head)
+    if r:
+        return r
+    if head[:8] == b"MComprHD" and rd:
+        r = sniff_chd(rd)
+        if r:
+            return r
+    if at(4, 8) == GBA_LOGO and len(head) > 0xB2 and head[0xB2] == 0x96:
+        return (PROBABLE, ["gba"], "en-tête GBA")
+    if at(0xC0, 8) == GBA_LOGO:
+        return (PROBABLE, ["nds"], "en-tête Nintendo DS")
+    if at(0x104, 8) == GB_LOGO:
+        if len(head) > 0x143 and head[0x143] in (0x80, 0xC0):
+            return (PROBABLE, ["gbc"], "en-tête Game Boy Color")
+        return (PROBABLE, ["gb"], "en-tête Game Boy")
+    if at(0x100, 4) in (b"NCSD", b"NCCH") or head[:4] == b"3DSX":
+        return (PROBABLE, ["n3ds"], "en-tête 3DS")
+    if at(0x100, 4) == b"HEAD" or head[:4] in (b"PFS0", b"NSO0") or at(0x10, 4) == b"NRO0":
+        return (PROBABLE, ["switch"], "conteneur Switch")
+    if head[:4] == b"WUX0":
+        return (PROBABLE, ["wiiu"], "conteneur WUX (Wii U)")
+    if at(0x100, 8) == b"SEGA 32X":
+        return (PROBABLE, ["sega32x"], "en-tête 32X")
+    if at(0x100, 4) == b"SEGA" or at(0x101, 4) == b"SEGA":
+        return (PROBABLE, ["genesis", "megadrive"], "en-tête Mega Drive")
+    for off in (0x7FF0, 0x3FF0, 0x1FF0):
+        if at(off, 8) == b"TMR SEGA" and len(head) > off + 0xF:
+            region = head[off + 0xF] >> 4
+            if region in (5, 6, 7):
+                return (PROBABLE, ["gamegear"], "en-tête Game Gear")
+            return (PROBABLE, ["mastersystem"], "en-tête Master System")
+    for off in (0x0, 0x10):
+        tag = at(off, 15)
+        if tag == b"SEGA SEGASATURN":
+            return (CERTAIN, ["saturn"], "disque Saturn")
+        if tag == b"SEGA SEGAKATANA":
+            return (CERTAIN, ["dreamcast"], "disque Dreamcast")
+        if tag[:14] == b"SEGADISCSYSTEM":
+            return (CERTAIN, ["segacd"], "disque Mega-CD")
+        if at(off, 7) == b"\x01ZZZZZ\x01":
+            return (PROBABLE, ["3do"], "disque 3DO")
+    if head[:4] == b"LYNX":
+        return (PROBABLE, ["atarilynx"], "en-tête Lynx")
+    if at(1, 9) == b"ATARI7800":
+        return (PROBABLE, ["atari7800"], "en-tête Atari 7800")
+    if at(0, 28) in (b"COPYRIGHT BY SNK CORPORATION", b" LICENSED BY SNK CORPORATION"):
+        if len(head) > 0x23 and head[0x23] == 0x10:
+            return (PROBABLE, ["ngpc"], "en-tête Neo Geo Pocket Color")
+        return (PROBABLE, ["ngp"], "en-tête Neo Geo Pocket")
+    if head[:8] == b"PS-X EXE":
+        return (PROBABLE, ["psx"], "exécutable PS-X")
+    if head[:4] == b"\x00PBP":
+        return (PROBABLE, ["psp", "psx"], "conteneur PBP")
+    if head[:2] in (b"\xaa\x55", b"\x55\xaa") and size <= 0x80000:
+        return (WEAK, ["colecovision"], "en-tête ColecoVision")
+    if rd is not None:
+        try:
+            r = sniff_iso(rd)
+        except (OSError, struct.error, IndexError, zlib.error):
+            r = None
+        if r:
+            return r
+        if rd.read(0x10000, 20) == b"MICROSOFT*XBOX*MEDIA":
+            return (CERTAIN, ["xbox"], "XISO (Xbox)")
+    if b"PC Engine CD-ROM SYSTEM" in head:
+        return (PROBABLE, ["pcenginecd"], "disque PC Engine CD")
+    s = snes_header(head, size)
+    if s:
+        return (PROBABLE, ["snes"], "en-tête SNES (%s)" % s)
+    v = virtualboy_header(tail, size)
+    if v:
+        return (PROBABLE, ["virtualboy"], "en-tête Virtual Boy (« %s »)" % v)
+    return None
+
+
+def sniff_file(path):
+    """Signatures d'un fichier, d'un dossier ou d'une archive."""
+    if os.path.isdir(path):
+        if os.path.isdir(os.path.join(path, "PS3_GAME")) or os.path.isfile(os.path.join(path, "PS3_DISC.SFB")):
+            return (CERTAIN, ["ps3"], "dossier PS3_GAME")
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".cue", ".gdi", ".m3u", ".ccd"):
+        for f in related_files(path):  # première piste reconnue
+            r = sniff_file(f)
+            if r and r[0] not in ("INFO",):
+                return (r[0], r[1], "%s > %s" % (os.path.basename(f), r[2]))
+        return None
+    if ext == ".zip":
+        return sniff_zip(path)
+    if ext == ".7z":
+        return sniff_7z(path)
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(HEAD_SIZE)
+            if head[:4] == b"CISO":
+                try:
+                    cso = CsoReader(fh)
+                    r = sniff_bytes(cso.read(0, HEAD_SIZE), cso, cso.size)
+                    if r:
+                        return (r[0], r[1], "CSO : " + r[2])
+                except (ValueError, struct.error, zlib.error):
+                    pass
+            tail = read_at(fh, max(0, size - 0x220), 0x220) if size >= 0x220 else b""
+            return sniff_bytes(head, FileReader(fh, size), size, tail)
+    except OSError:
+        return None
+
+
+ARCADE_HINT = re.compile(r"^[a-z0-9_]{1,12}\.[a-z0-9]{1,4}$", re.I)
+
+
+def _sniff_archive_member(name, head, size, members):
+    if len(members) >= 3 and all(ARCADE_HINT.match(os.path.basename(m)) for m in members):
+        return (WEAK, ["arcade"], "archive de type romset arcade")
+    r = sniff_bytes(head, None, size)
+    if r and r[1]:
+        return (r[0], r[1], "%s : %s" % (name, r[2]))
+    return ("ZIPEXT", os.path.splitext(name)[1], name)
+
+
+def sniff_zip(path):
+    try:
+        with zipfile.ZipFile(path) as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if not infos:
+                return None
+            biggest = max(infos, key=lambda i: i.file_size)
+            with zf.open(biggest) as fh:
+                head = fh.read(HEAD_SIZE)
+            return _sniff_archive_member(biggest.filename, head, biggest.file_size,
+                                         [i.filename for i in infos])
+    except (zipfile.BadZipFile, OSError, RuntimeError):
+        return None
+
+
+def list_7z(path):
+    """[(nom, taille)] d'une archive 7z, via py7zr ou la commande 7z."""
+    try:
+        import py7zr  # optionnel
+        with py7zr.SevenZipFile(path) as z:
+            return [(i.filename, i.uncompressed) for i in z.list() if not i.is_directory]
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    exe = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "l", "-slt", "-ba", path], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    items, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line.strip():
+            if cur.get("Path") and "D" not in cur.get("Attributes", ""):
+                items.append((cur["Path"], int(cur.get("Size") or 0)))
+            cur = {}
+        elif " = " in line:
+            k, v = line.split(" = ", 1)
+            cur[k.strip()] = v.strip()
+    return items
+
+
+def read_7z_member(path, name, n):
+    exe = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+    if not exe:
+        return b""
+    try:
+        p = subprocess.Popen([exe, "e", "-so", path, name], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        data = p.stdout.read(n)
+        p.kill()
+        p.wait()
+        p.stdout.close()
+        return data
+    except OSError:
+        return b""
+
+
+def sniff_7z(path):
+    items = list_7z(path)
+    if not items:
+        return None
+    name, size = max(items, key=lambda i: i[1])
+    return _sniff_archive_member(name, read_7z_member(path, name, HEAD_SIZE), size, [i[0] for i in items])
+
+
+def mime_type(path):
+    if os.path.isdir(path):
+        return None
+    try:
+        import magic  # python-magic, optionnel
+        return magic.from_file(path, mime=True)
+    except Exception:
+        pass
+    exe = shutil.which("file")
+    if exe:
+        try:
+            out = subprocess.run([exe, "--brief", "--mime-type", path], capture_output=True,
+                                 text=True, timeout=10)
+            return out.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return None
+
+
+def related_files(path):
+    """Fichiers référencés par un .cue / .gdi / .m3u / .ccd (spec §7 --copy)."""
+    d = os.path.dirname(path)
+    ext = os.path.splitext(path)[1].lower()
+    out = []
+    try:
+        if ext == ".cue":
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = re.match(r'\s*FILE\s+"([^"]+)"', line, re.I) or re.match(r"\s*FILE\s+(\S+)", line, re.I)
+                    if m:
+                        out.append(os.path.join(d, m.group(1)))
+        elif ext == ".gdi":
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in list(fh)[1:]:
+                    m = re.match(r'\s*\d+\s+\d+\s+\d+\s+\d+\s+(?:"([^"]+)"|(\S+))', line)
+                    if m:
+                        out.append(os.path.join(d, m.group(1) or m.group(2)))
+        elif ext == ".m3u":
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        out.append(os.path.join(d, line))
+        elif ext == ".ccd":
+            stem = os.path.splitext(path)[0]
+            for e in (".img", ".sub"):
+                if os.path.exists(stem + e):
+                    out.append(stem + e)
+    except OSError:
+        pass
+    return out
+
+
+class Detection:
+    def __init__(self):
+        self.system = None
+        self.method = ""
+        self.level = 0
+        self.candidates = []
+        self.in_library = False
+        self.dir_hint = None
+        self.warnings = []
+        self.mime = None
+        self.sniff = None
+
+
+def systems_for_platforms(ctx, platforms):
+    out = []
+    for s in ctx.ordered_systems():
+        if s.name in platforms or any(p in platforms for p in s.platforms):
+            out.append(s.name)
+    return out
+
+
+def detect_system(ctx, rom, forced=None, interactive=None, assume_yes=False):
+    det = Detection()
+    ext = os.path.splitext(os.path.basename(rom.rstrip("/")))[1]
+    conf = ctx.conf
+    excluded = set(conf.list("systems", "exclude"))
+
+    # 1. forçage
+    if forced:
+        if forced not in ctx.systems:
+            raise LaunchError("système inconnu : %s" % forced, EXIT_SYSTEM)
+        det.system, det.level, det.method = forced, CERTAIN, "--system"
+        det.in_library = _under(rom, ctx.systems[forced].path)
+        return det
+
+    # 2. chemin dans la bibliothèque
+    best = None
+    real_rom = os.path.realpath(rom)
+    for s in ctx.ordered_systems():
+        if s.path and (_under(rom, s.path) or _under(real_rom, os.path.realpath(s.path))):
+            if best is None or len(s.path) > len(best.path):
+                best = s
+    if best:
+        if best.accepts(ext):
+            det.system, det.level, det.method, det.in_library = best.name, CERTAIN, "chemin", True
+            return det
+        det.dir_hint = best.name
+        msg = "%s est dans le dossier du système %s mais l'extension %r n'y est pas déclarée : " \
+              "ES-DE ne l'afficherait pas" % (os.path.basename(rom), best.name, ext)
+        if best.accepts(ext, ignore_case=True):
+            msg += " (seule la casse diffère)"
+        det.warnings.append(msg)
+
+    levels = {}
+    if det.dir_hint and ctx.systems[det.dir_hint].accepts(ext, ignore_case=True) \
+            and det.dir_hint not in excluded:
+        levels[WEAK] = ([det.dir_hint], ["dossier du système (casse de l'extension)"])
+
+    def add(level, names, method):
+        names = [n for n in names if n in ctx.systems and n not in excluded]
+        if names:
+            cur = levels.setdefault(level, ([], []))
+            for n in names:
+                if n not in cur[0]:
+                    cur[0].append(n)
+            cur[1].append(method)
+
+    # 3. dossiers déclarés dans la conf
+    for folder, sysname in conf.folders().items():
+        if _under(rom, folder):
+            add(PROBABLE, [sysname], "dossier [folders]")
+
+    # 4. signatures d'en-tête
+    sn = sniff_file(rom)
+    det.sniff = sn
+    if sn and sn[0] == "ZIPEXT":
+        inner_ext = sn[1]
+        add(WEAK, [s.name for s in ctx.ordered_systems() if s.accepts(inner_ext, True) and s.accepts(ext)],
+            "extension dans l'archive (%s)" % sn[2])
+    elif sn and sn[0] == "INFO":
+        log("signature sans effet sur le choix : %s" % sn[2])
+    elif sn:
+        add(sn[0], systems_for_platforms(ctx, sn[1]), sn[2])
+
+    # 5. type MIME
+    det.mime = mime_type(rom)
+    if det.mime:
+        overrides = conf.mime_overrides()
+        if det.mime in overrides:
+            add(PROBABLE, [overrides[det.mime]], "MIME %s ([mime])" % det.mime)
+        elif det.mime in MIME_PLATFORMS:
+            add(PROBABLE, systems_for_platforms(ctx, MIME_PLATFORMS[det.mime]), "MIME %s" % det.mime)
+
+    # 6. extension seule
+    by_ext = [s.name for s in ctx.ordered_systems() if ext and s.accepts(ext)]
+    if by_ext:
+        add(WEAK, by_ext, "extension %s" % ext)
+    elif ext:
+        ci = [s.name for s in ctx.ordered_systems() if s.accepts(ext, ignore_case=True)]
+        if ci:
+            det.warnings.append("l'extension %r n'est déclarée qu'avec une autre casse" % ext)
+            add(WEAK, ci, "extension %s (casse ignorée)" % ext)
+
+    if not levels:
+        if det.dir_hint:
+            det.system, det.level, det.method = det.dir_hint, WEAK, "dossier du système (extension non déclarée)"
+            return det
+        raise LaunchError("impossible de déterminer le système de %s" % rom, EXIT_SYSTEM)
+
+    level = max(levels)
+    cands, methods = levels[level]
+    det.level, det.method = level, " + ".join(methods)
+    # affiner avec l'extension et l'indice de dossier
+    if level > WEAK and by_ext:
+        both = [c for c in cands if c in by_ext]
+        if both:
+            cands = both
+    if det.dir_hint and det.dir_hint in cands:
+        cands = [det.dir_hint]
+    det.candidates = list(cands)
+
+    if len(cands) == 1:
+        det.system = cands[0]
+        return det
+
+    # 7. priorités de la conf
+    prio = conf.ext_priority(ext) if ext else []
+    for name in prio:
+        if name in cands:
+            det.system, det.method = name, det.method + " + priorité [extensions]"
+            return det
+    for name in conf.list("systems", "priority"):
+        if name in cands:
+            det.system, det.method = name, det.method + " + priorité [systems]"
+            return det
+
+    policy = conf.get("launch", "ambiguity", "ask")
+    if assume_yes and policy == "ask":
+        policy = "fail"
+    if interactive is None:
+        interactive = sys.stdin.isatty() and sys.stderr.isatty()
+    if policy == "first":
+        det.system = cands[0]
+        det.method += " + premier candidat"
+        return det
+    if policy == "ask" and interactive:
+        print("Plusieurs systèmes possibles pour %s :" % os.path.basename(rom), file=sys.stderr)
+        for i, c in enumerate(cands, 1):
+            print("  %d) %s — %s" % (i, c, ctx.systems[c].fullname), file=sys.stderr)
+        while True:
+            print("Choix [1-%d] : " % len(cands), end="", file=sys.stderr, flush=True)
+            ans = sys.stdin.readline().strip()
+            if not ans:
+                raise LaunchError("aucun système choisi", EXIT_SYSTEM)
+            if ans.isdigit() and 1 <= int(ans) <= len(cands):
+                det.system = cands[int(ans) - 1]
+                det.method += " + choix interactif"
+                return det
+    raise LaunchError("système ambigu pour %s : %s (utilisez --system ou les priorités de la conf)"
+                      % (os.path.basename(rom), ", ".join(cands)), EXIT_SYSTEM)
+
+
+def _under(path, folder):
+    if not folder:
+        return False
+    path = os.path.abspath(path)
+    folder = os.path.abspath(folder)
+    return path.startswith(folder.rstrip("/") + "/")
+
+
+# ==========================================================================
+# Résolution de l'émulateur et construction de la commande — spec §5
+# ==========================================================================
+
+UNQUOTED_SPECIALS = set(" \t\n\"'\\$`!&*()[]{}<>;|?#")
+
+
+def esc_unquoted(s):
+    out = []
+    for i, c in enumerate(s):
+        if c in UNQUOTED_SPECIALS or (c == "~" and i == 0):
+            out.append("\\" + c)
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def esc_dquoted(s):
+    return re.sub(r'(["$`\\])', r"\\\1", s)
+
+
+def in_double_quotes(text, idx):
+    """Vrai si la position idx est entre guillemets doubles (non échappés)."""
+    inside, single, i = False, False, 0
+    while i < idx:
+        c = text[i]
+        if c == "\\" and not single:
+            i += 2
+            continue
+        if c == "'" and not inside:
+            single = not single
+        elif c == '"' and not single:
+            inside = not inside
+        i += 1
+    return inside
+
+
+def subst_path(cmd, var, value, raw=False):
+    """Remplace %VAR% par value, échappé selon le contexte (guillemets ou non)."""
+    token = "%" + var + "%"
+    out, pos = [], 0
+    while True:
+        i = cmd.find(token, pos)
+        if i < 0:
+            out.append(cmd[pos:])
+            break
+        out.append(cmd[pos:i])
+        if raw:
+            out.append(value)
+        elif in_double_quotes(cmd, i):
+            out.append(esc_dquoted(value))
+        else:
+            out.append(esc_unquoted(value))
+        pos = i + len(token)
+    return "".join(out)
+
+
+class Resolved:
+    def __init__(self):
+        self.command = ""
+        self.cwd = None
+        self.label = ""
+        self.label_reason = ""
+        self.emulator_path = None
+        self.run_in_background = False
+        self.notes = []
+
+
+def find_emulator(ctx, name):
+    """Applique les règles de recherche. Retourne (chemin, commande_alternative, règles_testées)."""
+    rules = ctx.emulators.get(name)
+    tried = []
+    if rules is None:
+        raise LaunchError("émulateur %s absent de es_find_rules.xml" % name, EXIT_EMULATOR)
+    for rtype, entries in rules:
+        for entry in entries:
+            tried.append("%s:%s" % (rtype, entry))
+            if rtype == "systempath":
+                p = shutil.which(entry)
+                if p:
+                    return p, None, tried
+            elif rtype == "staticpath":
+                path, _, alt = entry.partition("|")
+                for p in sorted(glob.glob(expand(path))):
+                    if os.path.isfile(p) and os.access(p, os.X_OK):
+                        return p, (alt.strip() or None), tried
+    return None, None, tried
+
+
+def find_core_dir(ctx, name, core_file):
+    rules = ctx.cores.get(name, [])
+    tried = []
+    for rtype, entries in rules:
+        if rtype != "corepath":
+            continue
+        for entry in entries:
+            d = expand(entry)
+            tried.append(d)
+            if os.path.isfile(os.path.join(d, core_file)):
+                return d, tried
+    return None, tried
+
+
+def choose_command(ctx, system, rom, forced_label=None):
+    """Spec §5 : --emulator > altemulator du jeu > alternativeEmulator du système > 1re commande."""
+    if not system.commands:
+        raise LaunchError("le système %s n'a aucune commande" % system.name, EXIT_EMULATOR)
+    labels = {label: cmd for label, cmd in system.commands}
+    gl = Gamelist.load(ctx.config_dir, system)
+    game = gl.game(rom) or {}
+    steps = [
+        (forced_label, "--emulator"),
+        (game.get("altemulator"), "émulateur alternatif du jeu (gamelist)"),
+        (gl.alt_emulator, "émulateur alternatif du système (gamelist)"),
+    ]
+    for label, reason in steps:
+        if not label:
+            continue
+        if label in labels:
+            return label, labels[label], reason, gl, game
+        if reason == "--emulator":
+            raise LaunchError("émulateur %r inconnu pour %s ; disponibles : %s"
+                              % (label, system.name, ", ".join(labels)), EXIT_EMULATOR)
+        warn("%s %r absent de es_systems.xml, repli" % (reason, label))
+    label, cmd = system.commands[0]
+    return label, cmd, "émulateur par défaut (1re commande)", gl, game
+
+
+def parse_desktop_exec(path):
+    """Ligne Exec= (et Path=) d'un fichier .desktop, codes de champ retirés."""
+    exec_line, workdir, in_entry = None, None, False
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith("["):
+                in_entry = line == "[Desktop Entry]"
+                continue
+            if not in_entry:
+                continue
+            if line.startswith("Exec=") and exec_line is None:
+                exec_line = line[5:]
+            elif line.startswith("Path=") and workdir is None:
+                workdir = line[5:]
+    if exec_line is None:
+        raise LaunchError("pas de ligne Exec= dans %s" % path, EXIT_EMULATOR)
+    exec_line = re.sub(r"%[fFuUdDnNickvm]", "", exec_line).replace("%%", "%").strip()
+    return exec_line, (workdir or None)
+
+
+KNOWN_LITERALS = {"RPCS3_GAMEID"}  # passé tel quel à RPCS3 (syntaxe %RPCS3_GAMEID%:SERIE)
+
+
+def build_command(ctx, system, rom, forced_label=None):
+    res = Resolved()
+    label, cmd, reason, _gl, _game = choose_command(ctx, system, rom, forced_label)
+    res.label, res.label_reason = label, reason
+    log("commande retenue : %s (%s) : %s" % (label, reason, cmd))
+    if cmd.startswith("PLACEHOLDER"):
+        raise LaunchError("le système %s n'est pas lançable sous Linux (commande PLACEHOLDER)"
+                          % system.name, EXIT_EMULATOR)
+
+    rom = os.path.abspath(rom)
+    gamedir = os.path.dirname(rom)
+    filename = os.path.basename(rom.rstrip("/"))
+    basename = os.path.splitext(filename)[0]
+
+    # Marqueurs
+    for flag in ("%HIDEWINDOW%", "%ESCAPESPECIALS%"):
+        cmd = cmd.replace(flag + " ", "").replace(flag, "")
+    if "%RUNINBACKGROUND%" in cmd:
+        res.run_in_background = True
+        cmd = cmd.replace("%RUNINBACKGROUND% ", "").replace("%RUNINBACKGROUND%", "")
+    shortcuts = "%ENABLESHORTCUTS%" in cmd
+    cmd = cmd.replace("%ENABLESHORTCUTS% ", "").replace("%ENABLESHORTCUTS%", "")
+
+    if shortcuts and rom.lower().endswith(".desktop"):
+        exec_line, workdir = parse_desktop_exec(rom)
+        res.command = exec_line
+        res.cwd = expand(workdir) if workdir else gamedir
+        res.notes.append("raccourci .desktop : ligne Exec= exécutée")
+        return res
+
+    def simple_vars(text, raw_ok=True):
+        text = text.replace("%BASENAME%", basename).replace("%FILENAME%", filename)
+        text = text.replace("%GAMEDIR%", gamedir).replace("%GAMEDIRRAW%", gamedir)
+        text = text.replace("%ROMPATH%", ctx.rom_dir).replace("%GAMEENTRYDIR%", rom)
+        return text
+
+    # %STARTDIR%=valeur
+    m = re.search(r"%STARTDIR%=(\S+)\s*", cmd)
+    startdir_raw = None
+    if m:
+        startdir_raw = m.group(1)
+        cmd = cmd[:m.start()] + cmd[m.end():]
+
+    # %INJECT%=fichier
+    def inject(mm):
+        fname = simple_vars(mm.group(1))
+        p = fname if os.path.isabs(fname) else os.path.join(gamedir, fname)
+        if os.path.isfile(p) and os.path.getsize(p) <= 4096:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                content = " ".join(fh.read().split())
+            res.notes.append("injecté depuis %s" % p)
+            return content
+        return ""
+    cmd = re.sub(r"%INJECT%=(\S+)", inject, cmd)
+
+    # %EMULATOR_X%
+    emudir = None
+    for mm in list(re.finditer(r"%EMULATOR_([A-Za-z0-9_!.\-]+)%", cmd)):
+        name = mm.group(1)
+        path, alt, tried = find_emulator(ctx, name)
+        if not path:
+            raise LaunchError("émulateur %s introuvable. Règles testées :\n  %s"
+                              % (name, "\n  ".join(tried)), EXIT_EMULATOR)
+        log("émulateur %s : %s" % (name, path))
+        res.emulator_path = path
+        emudir = os.path.dirname(path)
+        repl = alt if alt else esc_unquoted(path)
+        cmd = cmd.replace(mm.group(0), repl, 1)
+
+    # %PRECOMMAND_X%
+    for mm in list(re.finditer(r"%PRECOMMAND_([A-Za-z0-9_!.\-]+)%", cmd)):
+        path, alt, tried = find_emulator(ctx, mm.group(1))
+        if not path:
+            raise LaunchError("pré-commande %s introuvable. Règles testées :\n  %s"
+                              % (mm.group(1), "\n  ".join(tried)), EXIT_EMULATOR)
+        cmd = cmd.replace(mm.group(0), alt or esc_unquoted(path), 1)
+
+    # %CORE_X%/fichier
+    def core(mm):
+        name, core_file = mm.group(1), mm.group(2)
+        d, tried = find_core_dir(ctx, name, core_file)
+        if not d:
+            raise LaunchError("cœur %s introuvable. Dossiers testés :\n  %s"
+                              % (core_file, "\n  ".join(tried)), EXIT_EMULATOR)
+        log("cœur : %s/%s" % (d, core_file))
+        return esc_unquoted(d) + "/" + core_file
+    cmd = re.sub(r"%CORE_([A-Za-z0-9_!.\-]+)%/(\S+)", core, cmd)
+
+    # chemins
+    winpath = "Z:" + rom.replace("/", "\\")
+    cmd = subst_path(cmd, "ROMRAWWIN", winpath, raw=True)
+    cmd = subst_path(cmd, "ROMRAW", rom, raw=True)
+    cmd = subst_path(cmd, "GAMEDIRRAW", gamedir, raw=True)
+    cmd = subst_path(cmd, "ROM", rom)
+    cmd = subst_path(cmd, "GAMEDIR", gamedir)
+    cmd = subst_path(cmd, "GAMEENTRYDIR", rom)
+    cmd = subst_path(cmd, "ROMPATH", ctx.rom_dir)
+    cmd = subst_path(cmd, "BASENAME", basename)
+    cmd = subst_path(cmd, "FILENAME", filename)
+    if "%EMUDIR%" in cmd:
+        if not emudir:
+            raise LaunchError("%EMUDIR% sans émulateur résolu", EXIT_EMULATOR)
+        cmd = subst_path(cmd, "EMUDIR", emudir)
+    if "%ESPATH%" in cmd:
+        warn("%ESPATH% désigne le dossier d'ES-DE, qui peut être un montage temporaire (AppImage)")
+        cmd = subst_path(cmd, "ESPATH", "")
+
+    leftover = [v for v in re.findall(r"%([A-Z][A-Z0-9_!\-]*)%", cmd) if v not in KNOWN_LITERALS]
+    if leftover:
+        raise LaunchError("variable(s) ES-DE non gérée(s) : %s" % ", ".join("%" + v + "%" for v in leftover))
+
+    if startdir_raw:
+        sd = startdir_raw.replace("%GAMEDIR%", gamedir).replace("%GAMEENTRYDIR%", rom)
+        if "%EMUDIR%" in sd:
+            sd = sd.replace("%EMUDIR%", emudir or "")
+        res.cwd = expand(sd)
+    res.command = cmd.strip()
+    return res
+
+
+# ==========================================================================
+# Exécution et scripts — spec §6
+# ==========================================================================
+
+def scripts_enabled(ctx, args):
+    if args.no_scripts:
+        return False
+    if args.scripts:
+        return True
+    mode = ctx.conf.get("launch", "scripts", "always")
+    if mode == "never":
+        return False
+    if mode == "auto":
+        return bool(ctx.settings.get("CustomEventScripts"))
+    return True
+
+
+def event_scripts(ctx, event):
+    d = os.path.join(ctx.config_dir, "scripts", event)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for f in sorted(os.listdir(d)):
+        p = os.path.join(d, f)
+        if os.path.isfile(p):
+            if os.access(p, os.X_OK):
+                out.append(p)
+            else:
+                log("script non exécutable ignoré : %s" % p)
+    return out
+
+
+def run_scripts(ctx, event, script_args, env):
+    for s in event_scripts(ctx, event):
+        log("script %s : %s" % (event, s))
+        try:
+            rc = subprocess.call([s] + script_args, env=env)
+            if rc != 0:
+                warn("le script %s s'est terminé avec le code %d" % (s, rc))
+        except OSError as e:
+            warn("échec du script %s : %s" % (s, e))
+
+
+def game_name(gl_game, rom):
+    if gl_game and gl_game.get("name"):
+        return gl_game["name"]
+    return os.path.splitext(os.path.basename(rom.rstrip("/")))[0]
+
+
+def launch(ctx, args, system, rom, det, res):
+    cache = ctx.conf.cache_dir
+    os.makedirs(cache, exist_ok=True)
+    lock_fh = open(os.path.join(cache, "lock"), "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fh.close()
+        raise LaunchError("un autre lancement est en cours (verrou %s)" % os.path.join(cache, "lock"))
+
+    gl = Gamelist.load(ctx.config_dir, system)
+    name = game_name(gl.game(rom), rom)
+    script_args = [os.path.abspath(rom), name, system.name, system.fullname]
+    env = dict(os.environ)
+    env.update({"ESDE_LAUNCHER": "es-de-launch", "ESDE_SYSTEM": system.name,
+                "ESDE_EMULATOR_LABEL": res.label, "ESDE_DETECTION_METHOD": det.method})
+    use_scripts = scripts_enabled(ctx, args)
+    logpath = os.path.join(cache, "last_run.log")
+    rc = EXIT_ERROR
+    proc = None
+
+    def forward(signum, _frame):
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signum)
+            except OSError:
+                pass
+
+    old = {s: signal.signal(s, forward) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        if use_scripts:
+            run_scripts(ctx, "game-start", script_args, env)
+        log("lancement : %s (dossier : %s)" % (res.command, res.cwd or os.getcwd()))
+        with open(logpath, "w", encoding="utf-8") as logfh:
+            logfh.write("# %s\n# cwd: %s\n# %s\n" % (datetime.datetime.now().isoformat(timespec="seconds"),
+                                                     res.cwd or os.getcwd(), res.command))
+            logfh.flush()
+            out = None if VERBOSE else logfh
+            try:
+                proc = subprocess.Popen(["/bin/sh", "-c", res.command], cwd=res.cwd or None,
+                                        stdout=out, stderr=out, env=env, start_new_session=True)
+            except OSError as e:
+                raise LaunchError("échec du lancement : %s" % e, EXIT_EMULATOR)
+            while True:
+                try:
+                    rc = proc.wait()
+                    break
+                except InterruptedError:
+                    continue
+    finally:
+        if use_scripts:
+            run_scripts(ctx, "game-end", script_args, env)
+        for s, h in old.items():
+            signal.signal(s, h)
+        lock_fh.close()
+    return rc if rc >= 0 else 128 - rc
+
+
+# ==========================================================================
+# --info / --copy
+# ==========================================================================
+
+def file_hashes(path, limit=None):
+    h_crc, h_md5, h_sha1 = 0, hashlib.md5(), hashlib.sha1()
+
+    def feed(fh):
+        nonlocal h_crc
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            h_crc = zlib.crc32(chunk, h_crc)
+            h_md5.update(chunk)
+            h_sha1.update(chunk)
+
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if len(infos) == 1:
+                with zf.open(infos[0]) as fh:
+                    feed(fh)
+                return {"crc32": "%08x" % h_crc, "md5": h_md5.hexdigest(), "sha1": h_sha1.hexdigest(),
+                        "on": "contenu du zip : " + infos[0].filename}
+    with open(path, "rb") as fh:
+        feed(fh)
+    return {"crc32": "%08x" % h_crc, "md5": h_md5.hexdigest(), "sha1": h_sha1.hexdigest(), "on": "fichier"}
+
+
+def suggested_extension(ctx, system, rom):
+    ext = os.path.splitext(rom)[1]
+    if system.accepts(ext):
+        return None
+    if system.accepts(ext, ignore_case=True):
+        for e in system.extensions:
+            if e.lower() == ext.lower() and e == e.lower():
+                return e
+    if "n64" in system.platforms:
+        try:
+            with open(rom, "rb") as fh:
+                order = n64_byte_order(fh.read(4))
+            if order:
+                return "." + order
+        except OSError:
+            pass
+    return None
+
+
+def info(ctx, args, rom):
+    out = {"file": {"path": os.path.abspath(rom), "exists": os.path.exists(rom)}}
+    if os.path.isfile(rom):
+        out["file"]["size"] = os.path.getsize(rom)
+        out["file"]["extension"] = os.path.splitext(rom)[1]
+        try:
+            out["file"]["hashes"] = file_hashes(rom)
+        except OSError as e:
+            out["file"]["hashes"] = {"error": str(e)}
+    try:
+        det = detect_system(ctx, rom, args.system, interactive=False, assume_yes=True)
+    except LaunchError as e:
+        out["error"] = str(e)
+        return out, e.code
+    out["file"]["mime"] = det.mime
+    if det.sniff and det.sniff[0] != "ZIPEXT":  # y compris "INFO" (CHD de CD...)
+        out["file"]["header"] = det.sniff[2]
+    s = ctx.systems[det.system]
+    out["system"] = {"name": s.name, "fullname": s.fullname, "platforms": s.platforms,
+                     "detection": det.method, "certainty": LEVEL_NAMES.get(det.level, "?"),
+                     "other_candidates": [c for c in det.candidates if c != s.name]}
+    gl = Gamelist.load(ctx.config_dir, s)
+    game = gl.game(rom)
+    sug = suggested_extension(ctx, s, rom)
+    dest = os.path.join(s.path, os.path.basename(rom) if not sug else
+                        os.path.splitext(os.path.basename(rom))[0] + sug)
+    out["library"] = {"in_library": det.in_library, "system_dir": s.path,
+                      "proposed_path": None if det.in_library else dest,
+                      "suggested_extension": sug,
+                      "gamelist": {k: game.get(k) for k in ("name", "releasedate", "playcount", "lastplayed")
+                                   if game.get(k)} if game else None}
+    emus = []
+    label, _cmd, reason, _g, _gm = choose_command(ctx, s, rom, args.emulator)
+    for lab, c in s.commands:
+        names = re.findall(r"%EMULATOR_([A-Za-z0-9_!.\-]+)%", c)
+        found = all(find_emulator(ctx, n)[0] for n in names) if names else None
+        emus.append({"label": lab, "selected": lab == label, "emulator_found": found})
+    out["emulator"] = {"label": label, "reason": reason, "available": emus}
+    try:
+        res = build_command(ctx, s, rom, args.emulator)
+        out["emulator"]["command"] = res.command
+        out["emulator"]["cwd"] = res.cwd
+    except LaunchError as e:
+        out["emulator"]["command_error"] = str(e)
+    out["warnings"] = det.warnings
+    return out, EXIT_OK
+
+
+def print_info(data):
+    f = data.get("file", {})
+    print("Fichier       : %s" % f.get("path"))
+    if "size" in f:
+        print("Taille        : %d octets" % f["size"])
+    if f.get("mime"):
+        print("Type MIME     : %s" % f["mime"])
+    if f.get("header"):
+        print("En-tête       : %s" % f["header"])
+    h = f.get("hashes") or {}
+    if "crc32" in h:
+        print("CRC32/SHA-1   : %s / %s (%s)" % (h["crc32"], h["sha1"], h["on"]))
+    if "error" in data:
+        print("Erreur        : %s" % data["error"])
+        return
+    s = data["system"]
+    print("Système       : %s (%s)" % (s["name"], s["fullname"]))
+    print("Détection     : %s [%s]" % (s["detection"], s["certainty"]))
+    if s["other_candidates"]:
+        print("Autres        : %s" % ", ".join(s["other_candidates"]))
+    lib = data["library"]
+    print("Bibliothèque  : %s" % ("oui" if lib["in_library"] else "non → " + str(lib["proposed_path"])))
+    if lib.get("suggested_extension"):
+        print("Extension     : renommer en %s pour qu'ES-DE l'affiche" % lib["suggested_extension"])
+    if lib.get("gamelist"):
+        print("Gamelist      : %s" % ", ".join("%s=%s" % kv for kv in lib["gamelist"].items()))
+    e = data["emulator"]
+    print("Émulateur     : %s (%s)" % (e["label"], e["reason"]))
+    if e.get("command"):
+        print("Commande      : %s" % e["command"])
+        if e.get("cwd"):
+            print("Dossier       : %s" % e["cwd"])
+    if e.get("command_error"):
+        print("Commande      : impossible — %s" % e["command_error"].splitlines()[0])
+    print("Disponibles   :")
+    for a in e["available"]:
+        st = {True: "trouvé", False: "absent", None: "-"}[a["emulator_found"]]
+        print("  %s %-40s %s" % ("*" if a["selected"] else " ", a["label"], st))
+    for w in data.get("warnings", []):
+        print("Attention     : %s" % w)
+
+
+def same_content(a, b):
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(1 << 20), fb.read(1 << 20)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
+def copy_rom(ctx, args, rom):
+    det = detect_system(ctx, rom, args.system, assume_yes=args.yes)
+    s = ctx.systems[det.system]
+    for w in det.warnings:
+        warn(w)
+    if det.in_library and s.accepts(os.path.splitext(rom)[1]):
+        print("Déjà rangé : %s" % rom)
+        return EXIT_OK
+    if not s.path:
+        raise LaunchError("le système %s n'a pas de dossier" % s.name, EXIT_CONFIG)
+    sug = suggested_extension(ctx, s, rom)
+    main_name = os.path.basename(rom)
+    if sug:
+        if args.fix_ext:
+            main_name = os.path.splitext(main_name)[0] + sug
+        else:
+            warn("extension non déclarée pour %s : ajoutez --fix-ext pour renommer en %s" % (s.name, sug))
+    plan = [(rom, os.path.join(s.path, main_name))]
+    for f in related_files(rom):
+        if not os.path.exists(f):
+            raise LaunchError("fichier lié introuvable : %s" % f)
+        plan.append((f, os.path.join(s.path, os.path.relpath(f, os.path.dirname(rom)))))
+    # contrôle des conflits avant toute écriture
+    final = []
+    for src, dst in plan:
+        if os.path.exists(dst):
+            if os.path.isfile(src) and same_content(src, dst):
+                print("Identique, ignoré : %s" % dst)
+                continue
+            if args.overwrite:
+                pass
+            elif args.rename:
+                stem, ext = os.path.splitext(dst)
+                n = 1
+                while os.path.exists("%s (%d)%s" % (stem, n, ext)):
+                    n += 1
+                dst = "%s (%d)%s" % (stem, n, ext)
+            else:
+                raise LaunchError("destination existante et différente : %s (--overwrite ou --rename)"
+                                  % dst, EXIT_CONFLICT)
+        final.append((src, dst))
+    verb = "Déplacer" if args.move else "Copier"
+    for src, dst in final:
+        print("%s %s -> %s" % (verb, src, dst))
+        if args.dry_run:
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".es-de-launch.tmp"
+        if os.path.isdir(src):
+            if args.move:
+                shutil.move(src, dst)
+            else:
+                shutil.copytree(src, dst)
+            continue
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+        if args.move:
+            os.remove(src)
+    if not args.dry_run and final:
+        print("ES-DE doit relire la bibliothèque (redémarrage ou rechargement) pour voir le jeu.")
+    return EXIT_OK
+
+
+# ==========================================================================
+# Interface en ligne de commande — spec §2
+# ==========================================================================
+
+def print_detection(args):
+    found = detect_install()
+    config_dir = os.path.abspath(expand(args.config_dir)) if args.config_dir else detect_config_dir()
+    from_log = resources_from_log(config_dir)
+    if args.json:
+        print(json.dumps({"config_dir": config_dir, "resources_from_log": from_log, "installs": found},
+                         indent=2, ensure_ascii=False))
+        return EXIT_OK if found or from_log else EXIT_CONFIG
+    print("Données ES-DE    : %s%s" % (config_dir, "" if os.path.isdir(config_dir) else " (absent)"))
+    if from_log:
+        print("Ressources (log) : %s" % from_log)
+    if not found:
+        print("Aucune installation ES-DE détectée.")
+        return EXIT_OK if from_log else EXIT_CONFIG
+    for i, c in enumerate(found):
+        mark = "*" if i == 0 else " "
+        res = c["resources_dir"] or "dans l'AppImage (extraites en cache)"
+        print("%s %-9s %s" % (mark, c["type"], c["executable"] or "-"))
+        print("    réel       : %s" % c["real"])
+        print("    ressources : %s%s" % (res, "" if c["valid"] else " (absentes)"))
+        print("    trouvé par : %s" % c["origin"])
+    print("* = installation retenue par défaut")
+    return EXIT_OK
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="es-de-launch",
+                                description="Lance un jeu comme le ferait le menu d'ES-DE.")
+    p.add_argument("file", nargs="?", metavar="FICHIER", help="ROM ou jeu à lancer")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--info", action="store_true", help="affiche les informations sur la ROM")
+    mode.add_argument("--copy", action="store_true", help="range la ROM dans la bibliothèque")
+    mode.add_argument("--output-cmd", action="store_true", help="affiche la commande sans la lancer")
+    mode.add_argument("--init", action="store_true", help="détecte l'installation et génère la conf")
+    mode.add_argument("--show-conf", action="store_true", help="affiche la conf effective")
+    mode.add_argument("--detect-install", action="store_true",
+                      help="liste les installations ES-DE détectées, sans rien écrire")
+    p.add_argument("--conf", help="fichier de conf (défaut : ~/.config/es-de-launch.conf)")
+    p.add_argument("--config-dir", help="dossier de données ES-DE (défaut : ~/ES-DE)")
+    p.add_argument("--resources-dir", help="dossier contenant es_systems.xml et es_find_rules.xml")
+    p.add_argument("--system", help="force le système")
+    p.add_argument("--emulator", help="force une commande (label) du système")
+    sc = p.add_mutually_exclusive_group()
+    sc.add_argument("--scripts", action="store_true", help="force l'exécution des scripts")
+    sc.add_argument("--no-scripts", action="store_true", help="n'exécute pas les scripts")
+    p.add_argument("--json", action="store_true", help="sortie JSON (--info, --output-cmd)")
+    p.add_argument("--move", action="store_true", help="avec --copy : déplace")
+    p.add_argument("--dry-run", action="store_true", help="avec --copy : n'écrit rien")
+    p.add_argument("--overwrite", action="store_true", help="avec --copy : écrase")
+    p.add_argument("--rename", action="store_true", help="avec --copy : suffixe ' (1)' en cas de conflit")
+    p.add_argument("--fix-ext", action="store_true", help="avec --copy : corrige l'extension")
+    p.add_argument("--force", action="store_true", help="avec --init : remplace la conf existante")
+    p.add_argument("--refresh-cache", action="store_true", help="réextrait les XML de l'AppImage")
+    p.add_argument("-y", "--yes", action="store_true", help="aucune question interactive")
+    p.add_argument("-v", "--verbose", action="store_true", help="trace la résolution")
+    p.add_argument("--version", action="version", version="es-de-launch " + VERSION)
+    return p
+
+
+def main(argv=None):
+    global VERBOSE
+    args = build_parser().parse_args(argv)
+    VERBOSE = args.verbose
+    try:
+        if args.init:
+            path = expand(args.conf) if args.conf else default_conf_path()
+            generate_conf(path, args, force=args.force)
+            print("Configuration écrite dans %s" % path)
+            return EXIT_OK
+        if args.detect_install:
+            return print_detection(args)
+        conf = load_or_init_conf(args)
+        if args.show_conf:
+            conf.cp.write(sys.stdout)
+            return EXIT_OK
+        if not args.file:
+            print("es-de-launch : FICHIER manquant", file=sys.stderr)
+            return EXIT_USAGE
+        rom = os.path.abspath(expand(args.file))
+        if not os.path.exists(rom):
+            raise LaunchError("fichier introuvable : %s" % rom, EXIT_USAGE)
+        ctx = build_context(conf, args)
+
+        if args.info:
+            data, code = info(ctx, args, rom)
+            if args.json:
+                print(json.dumps(data, indent=2, ensure_ascii=False))
+            else:
+                print_info(data)
+            return code
+        if args.copy:
+            return copy_rom(ctx, args, rom)
+
+        det = detect_system(ctx, rom, args.system, assume_yes=args.yes)
+        for w in det.warnings:
+            warn(w)
+        system = ctx.systems[det.system]
+        log("système : %s (%s)" % (system.name, det.method))
+        res = build_command(ctx, system, rom, args.emulator)
+
+        if args.output_cmd:
+            if args.json:
+                print(json.dumps({
+                    "cwd": res.cwd, "command": res.command, "system": system.name,
+                    "emulator_label": res.label, "detection": det.method,
+                    "scripts": {"start": event_scripts(ctx, "game-start") if scripts_enabled(ctx, args) else [],
+                                "end": event_scripts(ctx, "game-end") if scripts_enabled(ctx, args) else []},
+                }, indent=2, ensure_ascii=False))
+            elif res.cwd:
+                print("cd %s && %s" % (esc_unquoted(res.cwd), res.command))
+            else:
+                print(res.command)
+            return EXIT_OK
+        return launch(ctx, args, system, rom, det, res)
+    except LaunchError as e:
+        print("es-de-launch : %s" % e, file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
