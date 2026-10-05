@@ -255,7 +255,10 @@ class TestConfigLoading(Env):
     def test_settings_without_root_element(self):
         s = L.load_settings(self.esde)
         self.assertTrue(s["CustomEventScripts"])
-        self.assertEqual(s["ROMDirectory"], self.roms)
+        self.assertEqual(s["ROMDirectory"], "")
+        self.assertTrue(s["AlternativeEmulatorPerGame"])  # valeur par défaut d'ES-DE
+        # getROMDirectory() : <home>/ROMs/ avec barre finale
+        self.assertEqual(self.ctx().rom_dir, self.roms + "/")
 
     def test_real_es_systems(self):
         ctx = self.ctx()
@@ -330,13 +333,14 @@ class TestConfigLoading(Env):
         ctx = self.ctx()
         self.assertIn("RETROARCH", ctx.emulators)
         self.assertIn("PLAY!", ctx.emulators)
-        self.assertEqual(ctx.cores["RETROARCH"][0][0], "corepath")
+        self.assertIn("~/.config/retroarch/cores", ctx.cores["RETROARCH"]["corepath"])
+        self.assertIn("retroarch", ctx.emulators["RETROARCH"]["systempath"])
 
     def test_gamelist(self):
         ctx = self.ctx()
-        g = L.Gamelist.load(self.esde, ctx.systems["snes"])
+        g = L.Gamelist.load(ctx, ctx.systems["snes"])
         self.assertEqual(g.alt_emulator, "bsnes-hd")
-        g = L.Gamelist.load(self.esde, ctx.systems["n64"])
+        g = L.Gamelist.load(ctx, ctx.systems["n64"])
         game = g.game(os.path.join(self.roms, "n64", "Zelda.z64"))
         self.assertEqual(game["altemulator"], "ParaLLEl N64")
 
@@ -525,15 +529,17 @@ class TestCommand(Env):
         rom = self.rom("arcade/pacman.zip")
         res = self.cmd("arcade", rom, "MAME (Standalone)")
         self.assertEqual(res.cwd, os.path.join(self.home, ".mame"))
-        self.assertIn("-rompath %s\\;%s/arcade pacman" % (os.path.join(self.roms, "arcade"), self.roms),
+        self.assertIn("-rompath %s\\;%s//arcade pacman" % (os.path.join(self.roms, "arcade"), self.roms),
                       res.command)
+        self.assertEqual(res.shell_command, "cd %s && %s" % (os.path.join(self.home, ".mame"), res.command))
 
     def test_mame_libretro_quoting(self):
         rom = self.rom("apple2/Karateka (1984) l'original.dsk")
         res = self.cmd("apple2", rom, "MAME - Current")
         argv = shlex.split(res.command)
         gd = os.path.join(self.roms, "apple2")
-        self.assertEqual(argv[3], 'apple2e -rompath "%s;%s/apple2" -gameio joy -flop1 "%s/%s"'
+        # %ROMPATH% garde son / final (ROMs//apple2) et %FILENAME% n'est jamais échappé
+        self.assertEqual(argv[3], 'apple2e -rompath "%s;%s//apple2" -gameio joy -flop1 "%s/%s"'
                          % (gd, self.roms, gd, os.path.basename(rom)))
 
     def test_special_characters_in_rom(self):
@@ -546,7 +552,9 @@ class TestCommand(Env):
                        "[Desktop Entry]\nType=Application\nName=DS\nExec=/usr/bin/rpcs3 --no-gui %U \"/games/BLUS30443\"\n")
         res = self.cmd("ps3", rom, "RPCS3 Shortcut (Standalone)")
         self.assertEqual(res.command, '/usr/bin/rpcs3 --no-gui  "/games/BLUS30443"')
-        self.assertEqual(res.cwd, os.path.join(self.roms, "ps3"))
+        self.assertIsNone(res.cwd)  # pas de Path= ni de %STARTDIR% : dossier courant
+        # Le 1er argument des scripts devient la ligne Exec= (comportement d'ES-DE)
+        self.assertEqual(res.rom_path, '/usr/bin/rpcs3 --no-gui  "/games/BLUS30443"')
 
     def test_shell_script_shortcut(self):
         rom = self.rom("n64/port.sh", "#!/bin/sh\n")
@@ -570,18 +578,235 @@ class TestCommand(Env):
         ctx = self.ctx()
         apps = os.path.join(self.home, "Applications")
         write(os.path.join(apps, "Foo-1.2.AppImage"), "#!/bin/sh\n", 0o755)
-        ctx.emulators["FOO"] = [("systempath", ["introuvable-xyz"]),
-                                ("staticpath", ["~/Applications/Foo*.AppImage|flatpak run --command=foo org.Foo"])]
-        path, alt, tried = L.find_emulator(ctx, "FOO")
-        self.assertEqual(path, os.path.join(apps, "Foo-1.2.AppImage"))
-        self.assertEqual(alt, "flatpak run --command=foo org.Foo")
+        # Les règles staticpath viennent avant systempath dans le fichier : ES-DE essaie
+        # quand même tous les systempath d'abord.
+        ctx.emulators["FOO"] = {"systempath": ["introuvable-xyz"],
+                                "staticpath": ["~/Applications/Foo*.AppImage|flatpak run --command=foo org.Foo"]}
+        cmd, exe, status, entry, tried = L.find_emulator(ctx, "%EMULATOR_FOO% -x %ROM%")
+        self.assertEqual(status, L.FOUND)
+        self.assertEqual(exe, "flatpak run --command=foo org.Foo")
+        self.assertEqual(cmd, "flatpak run --command=foo org.Foo -x %ROM%")
         self.assertEqual(tried[0], "systempath:introuvable-xyz")
+        ctx.emulators["FOO"]["staticpath"] = ["~/Applications/Foo*.AppImage"]
+        cmd, exe, status, entry, tried = L.find_emulator(ctx, "%EMULATOR_FOO%")
+        self.assertEqual(exe, os.path.join(apps, "Foo-1.2.AppImage"))
+
+    def test_systempath_before_staticpath_and_no_exec_bit(self):
+        ctx = self.ctx()
+        write(os.path.join(self.bin, "foo-emu"), "pas exécutable\n")  # ES-DE ne teste pas le bit x
+        write(os.path.join(self.home, "foo"), "#!/bin/sh\n", 0o755)
+        ctx.emulators["FOO"] = {"systempath": ["foo-emu"], "staticpath": ["~/foo"]}
+        _cmd, exe, status, _e, _t = L.find_emulator(ctx, "%EMULATOR_FOO%")
+        self.assertEqual(exe, os.path.join(self.bin, "foo-emu"))
+
+    def test_no_rules_and_method_two(self):
+        ctx = self.ctx()
+        ctx.emulators["VIDE"] = {"systempath": [], "staticpath": []}
+        self.assertEqual(L.find_emulator(ctx, "%EMULATOR_VIDE% %ROM%")[2], L.NO_RULES)
+        cmd, exe, status, entry, _t = L.find_emulator(ctx, "retroarch -L x %ROM%")
+        self.assertEqual((exe, status), (os.path.join(self.bin, "retroarch"), L.FOUND))
+        self.assertEqual(L.find_emulator(ctx, "inexistant-xyz %ROM%")[2], L.NOT_FOUND)
 
     def test_escaping_helpers(self):
-        self.assertEqual(L.esc_unquoted("a b'c"), "a\\ b\\'c")
-        self.assertEqual(L.esc_dquoted('a"$b'), 'a\\"\\$b')
-        self.assertTrue(L.in_double_quotes('x "ab', 4))
-        self.assertFalse(L.in_double_quotes('x \\"ab', 5))
+        # getEscapedPath() : \\ ' " ! $ ^ & * ( ) { } [ ] ? ; < > et l'espace ; pas ` | # ~
+        self.assertEqual(L.es_escape("/a b/l'x (1) [!].zip"), "/a\\ b/l\\'x\\ \\(1\\)\\ \\[\\!\\].zip")
+        self.assertEqual(L.es_escape("a`b|c#~d"), "a`b|c#~d")
+        self.assertEqual(L.es_escape("a\\b"), "a\\\\b")
+        self.assertEqual(L.es_escape("a\\ b"), "a\\\\ b")  # espace déjà précédé d'un \\
+        self.assertEqual(L.es_extension("/x/jeu"), ".")
+        self.assertEqual(L.es_extension("/x/jeu.tar.gz"), ".gz")
+        self.assertEqual(L.strip_field_codes('app %U --x "%%f" %f'), 'app  --x "%f"')
+
+
+# ==========================================================================
+# Fidélité au code d'ES-DE 3.5.0 (FileData.cpp, SystemData.cpp, Scripting.cpp…)
+# ==========================================================================
+
+class TestEsdeFidelity(Env):
+    def cmd(self, system, rom, label=None, ctx=None):
+        ctx = ctx or self.ctx()
+        return L.build_command(ctx, ctx.systems[system], rom, label)
+
+    def custom_system(self, command, extensions=".x", name="essai", extra=""):
+        write(os.path.join(self.esde, "custom_systems", "es_systems.xml"),
+              "%s<systemList><system><name>%s</name><fullname>Essai</fullname>"
+              "<path>%%ROMPATH%%/%s</path><extension>%s</extension>"
+              "<command label=\"A\">%s</command><command label=\"B\">retroarch %%ROM%%</command>"
+              "<platform>essai</platform><theme>essai</theme></system></systemList>"
+              % (extra, name, name, extensions, command.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")))
+
+    def test_game_altemulator_invalid_falls_to_default_not_system(self):
+        write(os.path.join(self.esde, "gamelists", "snes", "gamelist.xml"),
+              "<alternativeEmulator><label>bsnes-hd</label></alternativeEmulator><gameList>"
+              "<game><path>./jeu.sfc</path><name>Jeu</name><altemulator>Disparu</altemulator></game>"
+              "</gameList>")
+        rom = self.rom("snes/jeu.sfc")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            res = self.cmd("snes", rom)
+        self.assertEqual(res.label, "Snes9x - Current")  # pas bsnes-hd
+        self.assertIn("Disparu", err.getvalue())
+
+    def test_alternative_emulator_per_game_setting(self):
+        write(os.path.join(self.esde, "settings", "es_settings.xml"),
+              '<bool name="AlternativeEmulatorPerGame" value="false" />\n')
+        rom = self.rom("n64/Zelda.z64", n64_rom())
+        self.assertEqual(self.cmd("n64", rom).label, "Mupen64Plus-Next")
+
+    def test_invalid_system_alternative(self):
+        write(os.path.join(self.esde, "gamelists", "snes", "gamelist.xml"),
+              "<gameList><alternativeEmulator><label>Inconnu</label></alternativeEmulator></gameList>")
+        rom = self.rom("snes/jeu.sfc")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.cmd("snes", rom).label, "Snes9x - Current")
+
+    def test_inject_concatenates_lines_and_quoted_form(self):
+        self.custom_system('%INJECT%="%BASENAME%.args" %EMULATOR_RETROARCH% %INJECT%=%BASENAME%.more %ROM%')
+        rom = self.rom("essai/jeu.x")
+        write(os.path.join(self.roms, "essai", "jeu.args"), "VAR=1\r\n")
+        write(os.path.join(self.roms, "essai", "jeu.more"), "--a\n--b\n")
+        res = self.cmd("essai", rom)
+        self.assertEqual(res.command, "VAR=1 %s --a--b %s" % (os.path.join(self.bin, "retroarch"), L.es_escape(rom)))
+
+    def test_inject_too_big_is_ignored(self):
+        self.custom_system("retroarch %INJECT%=%BASENAME%.args %ROM%")
+        rom = self.rom("essai/jeu.x")
+        write(os.path.join(self.roms, "essai", "jeu.args"), "x" * 5000)
+        with contextlib.redirect_stderr(io.StringIO()):
+            res = self.cmd("essai", rom)
+        self.assertNotIn("xxxx", res.command)
+
+    def test_quoted_startdir_with_spaces_is_created_at_launch(self):
+        self.custom_system('%STARTDIR%="~/Mon dossier" %EMULATOR_RETROARCH% %ROM%')
+        rom = self.rom("essai/jeu.x")
+        res = self.cmd("essai", rom)
+        self.assertEqual(res.cwd, os.path.join(self.home, "Mon dossier"))
+        self.assertEqual(res.shell_command, "cd %s && %s" % (L.es_escape(res.cwd), res.command))
+        code, _o, err = self.run_main("--no-scripts", rom)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isdir(res.cwd))
+
+    def test_quoted_core(self):
+        self.custom_system('retroarch -L "%CORE_RETROARCH%/mgba_libretro.so" %ROM%')
+        rom = self.rom("essai/jeu.x")
+        res = self.cmd("essai", rom)
+        # Sans %EMULATOR_, ES-DE vérifie le 1er mot mais ne le remplace pas
+        self.assertEqual(res.command, "retroarch -L %s %s" % (
+                         os.path.join(self.home, ".config/retroarch/cores/mgba_libretro.so"), L.es_escape(rom)))
+
+    def test_emupath(self):
+        write(os.path.join(self.bin, "cores", "x_libretro.so"), "")
+        self.custom_system("retroarch -L %EMUPATH%/cores/x_libretro.so %ROM%")
+        rom = self.rom("essai/jeu.x")
+        self.assertIn(os.path.join(self.bin, "cores/x_libretro.so"), self.cmd("essai", rom).command)
+
+    def test_raw_variables_and_tilde(self):
+        self.custom_system("retroarch %ROMRAW% %ROMRAWWIN% %BASENAME% %FILENAME% %GAMEDIRRAW% ~/x")
+        rom = self.rom("essai/un jeu (v1).x")
+        res = self.cmd("essai", rom)
+        d = os.path.join(self.roms, "essai")
+        self.assertEqual(res.command, "retroarch %s %s un jeu (v1) un jeu (v1).x %s %s/x" % (
+            rom, rom.replace("/", "\\"), d, self.home))
+
+    def test_directory_interpreted_as_file(self):
+        self.custom_system("retroarch %ROM% %BASENAME% %FILENAME%", extensions=".ps3")
+        d = os.path.join(self.roms, "essai", "Jeu.ps3")
+        inner = write(os.path.join(d, "Jeu.ps3"), "x")
+        det = L.detect_system(self.ctx(), d)
+        self.assertEqual((det.system, det.method), ("essai", "chemin"))
+        res = self.cmd("essai", d)
+        self.assertEqual(res.command, "retroarch %s Jeu Jeu.ps3" % inner)
+
+    def test_no_extension_means_dot(self):
+        self.custom_system("retroarch %ROM% %FILENAME%", extensions=". .x")
+        rom = self.rom("essai/default")
+        self.assertEqual(L.detect_system(self.ctx(), rom).system, "essai")
+        self.assertTrue(self.cmd("essai", rom).command.endswith(" default."))
+
+    def test_load_exclusive(self):
+        self.custom_system("retroarch %ROM%", extra="<loadExclusive/>")
+        ctx = self.ctx()
+        self.assertEqual(list(ctx.systems), ["essai"])
+
+    def test_duplicate_labels_and_label_rules(self):
+        write(os.path.join(self.esde, "custom_systems", "es_systems.xml"),
+              "<systemList><system><name>essai</name><fullname>E</fullname><path>%ROMPATH%/essai</path>"
+              "<extension>.x,.y</extension><command label=\"A\">a %ROM%</command>"
+              "<command label=\"A\">b %ROM%</command><command>c %ROM%</command>"
+              "<command label=\"D\">d %ROM%</command><platform>Essai, Autre</platform></system></systemList>")
+        with contextlib.redirect_stderr(io.StringIO()):
+            s = self.ctx().systems["essai"]
+        self.assertEqual(s.commands, [("A", "a %ROM%")])
+        self.assertEqual(s.extensions, [".x", ".y"])
+        self.assertEqual(s.platforms, ["essai", "autre"])
+        self.assertEqual(s.theme, "essai")  # thème absent : nom du système
+
+    def test_resources_override_in_data_dir(self):
+        d = os.path.join(self.esde, "resources", "systems", L.SYSTEMS_DIR)
+        os.makedirs(d)
+        with open(os.path.join(FIXTURES, "es_find_rules.xml")) as fh:
+            content = fh.read().replace("<entry>retroarch</entry>", "<entry>retroarch-perso</entry>")
+        write(os.path.join(d, "es_find_rules.xml"), content)
+        ctx = self.ctx()
+        self.assertEqual(ctx.find_rules_file, os.path.join(d, "es_find_rules.xml"))
+        self.assertEqual(ctx.systems_file, os.path.join(FIXTURES, "es_systems.xml"))
+        self.assertIn("retroarch-perso", ctx.emulators["RETROARCH"]["systempath"])
+
+    def test_malformed_custom_find_rules_is_skipped(self):
+        write(os.path.join(self.esde, "custom_systems", "es_find_rules.xml"), "<ruleList><emulator>")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ctx = self.ctx()
+        self.assertIn("RETROARCH", ctx.emulators)
+
+    def test_legacy_gamelist_location(self):
+        write(os.path.join(self.esde, "settings", "es_settings.xml"),
+              '<bool name="LegacyGamelistFileLocation" value="true" />\n')
+        write(os.path.join(self.roms, "snes", "gamelist.xml"),
+              "<gameList><alternativeEmulator><label>bsnes</label></alternativeEmulator></gameList>")
+        rom = self.rom("snes/jeu.sfc")
+        ctx = self.ctx()
+        self.assertEqual(L.choose_command(ctx, ctx.systems["snes"], rom)[0], "bsnes")
+
+    def test_desktop_path_ignored_with_startdir_and_last_exec_wins(self):
+        self.custom_system("%STARTDIR%=%GAMEDIR% %ENABLESHORTCUTS% %EMULATOR_OS-SHELL% %ROM%", extensions=".desktop")
+        rom = self.rom("essai/jeu.desktop", "#!/usr/bin/env xdg-open\n  [Desktop Entry]\n"
+                       "Exec=premier\nPath=/tmp\n[Desktop Action x]\nExec=dernier %%u %u\n")
+        res = self.cmd("essai", rom)
+        self.assertEqual(res.command, "dernier %u")
+        self.assertEqual(res.cwd, os.path.join(self.roms, "essai"))
+
+    def test_run_in_background_flag_and_setting(self):
+        rom = self.rom("steam/jeu.desktop", "[Desktop Entry]\nExec=steam steam://rungameid/1\n")
+        res = self.cmd("steam", rom)
+        self.assertTrue(res.run_in_background)
+        self.assertEqual(res.command, "steam steam://rungameid/1")
+        write(os.path.join(self.esde, "settings", "es_settings.xml"), '<bool name="RunInBackground" value="1"/>\n')
+        rom2 = self.rom("n64/Other.z64", n64_rom())
+        self.assertTrue(self.cmd("n64", rom2).run_in_background)
+
+    def test_placeholder_command(self):
+        rom = self.rom("xboxone/x.zip")
+        with self.assertRaises(L.LaunchError) as cm:
+            self.cmd("xboxone", rom)
+        self.assertIn("PLACEHOLDER", str(cm.exception))
+
+    def test_esde_appdata_dir_and_portable_txt(self):
+        os.environ["ESDE_APPDATA_DIR"] = "~/autre-ES-DE"
+        self.assertEqual(L.detect_config_dir(self.home), os.path.join(self.home, "autre-ES-DE"))
+        del os.environ["ESDE_APPDATA_DIR"]
+        app = os.path.join(self.tmp, "esde-portable")
+        write(os.path.join(app, "es-de"), b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64, 0o755)
+        write(os.path.join(app, "portable.txt"), "data\n")
+        os.makedirs(os.path.join(app, "data"))
+        self.assertEqual(L.esde_home(os.path.join(app, "es-de")), app + "/data")
+
+    def test_scripts_command_line_and_non_executable(self):
+        write(os.path.join(self.esde, "scripts", "game-start", "a-non-exec.sh"), "echo x\n")
+        line = L.script_command_line("/s/x.sh", ["/r/a\\ b.z64", "Nom", "n64", '"déjà"'])
+        self.assertEqual(line, '"/s/x.sh" "/r/a\\ b.z64" "Nom" "n64" "déjà"')
+        ctx = self.ctx()
+        self.assertEqual([os.path.basename(s) for s in L.event_scripts(ctx, "game-start")],
+                         ["a-non-exec.sh", "lcd.sh"])  # ES-DE ne filtre pas le bit x
 
 
 # ==========================================================================
@@ -594,10 +819,12 @@ class TestLaunch(Env):
         code, _out, err = self.run_main(rom)
         self.assertEqual(code, 0, err)
         lines = self.calls_lines()
-        self.assertTrue(lines[0].startswith("game-start %s|Mario Kart 64|n64|Nintendo 64|es-de-launch" % rom))
+        # ES-DE passe aux scripts le chemin ÉCHAPPÉ entre guillemets : les \\ restent
+        esc = L.es_escape(rom)
+        self.assertTrue(lines[0].startswith("game-start %s|Mario Kart 64|n64|Nintendo 64|es-de-launch" % esc))
         self.assertTrue(lines[1].startswith("EMU retroarch"))
         self.assertIn("ARG %s" % rom, lines)
-        self.assertTrue(lines[-1].startswith("game-end %s|Mario Kart 64|n64" % rom))
+        self.assertTrue(lines[-1].startswith("game-end %s|Mario Kart 64|n64" % esc))
 
     def test_exit_code_and_game_end_on_failure(self):
         rom = self.rom("n64/Other.z64", n64_rom())
@@ -1033,7 +1260,7 @@ class TestInstallTypes(Env):
 
     def resolve(self):
         ns = L.argparse.Namespace(config_dir=None, resources_dir=None, refresh_cache=False)
-        return L.resolve_resources(self.auto_conf(), ns, self.esde)
+        return L.resolve_resources(self.auto_conf(), ns, self.esde)[:2]
 
     def only(self, kind):
         found = L.detect_install()
@@ -1096,7 +1323,7 @@ class TestInstallTypes(Env):
             ctx = L.build_context(L.Conf.load(self.conf_path),
                                   L.argparse.Namespace(config_dir=None, resources_dir=None, refresh_cache=False))
         self.assertEqual(len(ctx.systems), 195)
-        self.assertIn("bac à sable", err.getvalue())
+        self.assertIn("aucune version de ce type", err.getvalue())
 
     def test_appimage_standard_and_nonstandard_runtime(self):
         a = write(os.path.join(self.home, "Applications/ES-DE_x64.AppImage"), ELF_APPIMAGE, 0o755)
@@ -1147,7 +1374,7 @@ class TestInstallTypes(Env):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             got = L.resolve_resources(L.Conf.load(self.conf_path),
-                                      L.argparse.Namespace(resources_dir=None, refresh_cache=False), self.esde)
+                                      L.argparse.Namespace(resources_dir=None, refresh_cache=False), self.esde)[:2]
         self.assertEqual(got, (res, "system"))
         self.assertIn("introuvable", err.getvalue())
 
