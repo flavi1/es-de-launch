@@ -1325,6 +1325,14 @@ class TestInstallTypes(Env):
         self.assertEqual(len(ctx.systems), 195)
         self.assertIn("aucune version de ce type", err.getvalue())
 
+    def test_wrapper_script_is_not_an_install(self):
+        # Cas réel : ~/.local/bin/start-es-de (script) à côté de l'AppImage
+        write(os.path.join(self.home, "Applications/es-de"), ELF_APPIMAGE, 0o755)
+        write(os.path.join(self.home, "Applications/es-de_3.4.1.OLD"), ELF_APPIMAGE, 0o755)
+        write(os.path.join(self.home, ".local/bin/start-es-de"), "#!/bin/sh\nexec es-de\n", 0o755)
+        found = L.detect_install()
+        self.assertEqual([os.path.basename(c["executable"]) for c in found], ["es-de", "es-de_3.4.1.OLD"])
+
     def test_appimage_standard_and_nonstandard_runtime(self):
         a = write(os.path.join(self.home, "Applications/ES-DE_x64.AppImage"), ELF_APPIMAGE, 0o755)
         self.assertTrue(L.is_appimage(a))

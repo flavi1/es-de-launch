@@ -565,11 +565,14 @@ def detect_install():
 
     # 1. ce que l'utilisateur lance réellement
     add(shutil.which("es-de"), "PATH")
-    # 2. emplacements d'AppImage usuels (les mêmes que ceux des règles de recherche d'ES-DE)
+    # 2. emplacements d'AppImage usuels (les mêmes que ceux des règles de recherche d'ES-DE).
+    # Les noms trouvés par motif ne sont gardés que s'il s'agit d'une AppImage : un script
+    # comme ~/.local/bin/start-es-de n'est pas une installation.
     for d in ("Applications", "AppImages", ".local/bin", "bin", ".local/share/applications"):
         for pattern in ("es-de", "ES-DE*.AppImage", "es-de*.AppImage", "*ES-DE*", "*es-de*"):
             for p in sorted(glob.glob(os.path.join(home(), d, pattern))):
-                add(p, "~/" + d)
+                if os.path.basename(p) == "es-de" or is_appimage(os.path.realpath(p)):
+                    add(p, "~/" + d)
     # 3. paquets et compilations
     for p in ("/usr/bin/es-de", "/usr/games/es-de", "/usr/local/bin/es-de", "/opt/es-de/es-de"):
         add(_r(p), "standard")
