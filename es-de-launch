@@ -1599,18 +1599,27 @@ def detect_system(ctx, rom, forced=None, interactive=None, assume_yes=False):
         det.in_library = _under(rom, ctx.systems[forced].path)
         return det
 
-    # 2. chemin dans la bibliothèque
-    best = None
+    # 2. chemin dans la bibliothèque. Plusieurs systèmes peuvent partager un dossier
+    # (ex. n64 et un système personnalisé pour les .wad du même dossier) : ES-DE montre le
+    # fichier dans chaque système qui déclare son extension. On retient d'abord ceux-là,
+    # puis le dossier le plus précis, puis l'ordre de chargement (personnalisés d'abord).
     real_rom = os.path.realpath(rom)
-    for s in ctx.ordered_systems():
-        if s.path and (_under(rom, s.path) or _under(real_rom, os.path.realpath(s.path))):
-            if best is None or len(s.path) > len(best.path):
-                best = s
+    is_game = not (os.path.isdir(rom) and ext == ".")  # populateFolder() : dossier sans extension
+    containing = [s for s in ctx.ordered_systems()
+                  if s.path and (_under(rom, s.path) or _under(real_rom, os.path.realpath(s.path)))]
+    accepting = [s for s in containing if is_game and s.accepts(ext)]
+    if accepting:
+        longest = max(len(s.path) for s in accepting)
+        same = [s for s in accepting if len(s.path) == longest]
+        det.system, det.level, det.method, det.in_library = same[0].name, CERTAIN, "chemin", True
+        det.candidates = [s.name for s in same]
+        if len(same) > 1:
+            det.warnings.append("%s apparaît dans plusieurs systèmes ES-DE (%s) : %s retenu ; "
+                                "--system pour un autre" % (os.path.basename(rom),
+                                                            ", ".join(det.candidates), same[0].name))
+        return det
+    best = max(containing, key=lambda s: len(s.path)) if containing else None
     if best:
-        # populateFolder() : un dossier sans extension n'est jamais un jeu.
-        if best.accepts(ext) and not (os.path.isdir(rom) and ext == "."):
-            det.system, det.level, det.method, det.in_library = best.name, CERTAIN, "chemin", True
-            return det
         det.dir_hint = best.name
         msg = "%s est dans le dossier du système %s mais l'extension %r n'y est pas déclarée : " \
               "ES-DE ne l'afficherait pas" % (os.path.basename(rom), best.name, ext)

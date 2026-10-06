@@ -741,6 +741,24 @@ class TestEsdeFidelity(Env):
         self.assertEqual(s.platforms, ["essai", "autre"])
         self.assertEqual(s.theme, "essai")  # thème absent : nom du système
 
+    def test_two_systems_share_a_folder(self):
+        # Cas réel : n64vc (personnalisé, .wad -> Dolphin) lit le même dossier que n64
+        write(os.path.join(self.esde, "custom_systems", "es_systems.xml"),
+              "<systemList><system><name>n64vc</name><fullname>Nintendo 64 Virtual Console</fullname>"
+              "<path>%ROMPATH%/n64</path><extension>.wad .WAD</extension>"
+              "<command label=\"Dolphin (Standalone)\">%INJECT%=%BASENAME%.esprefix %EMULATOR_DOLPHIN% -b -e %ROM%"
+              "</command><platform>n64</platform><theme>n64</theme></system></systemList>")
+        ctx = self.ctx()
+        wad = self.rom("n64/Mario Kart 64.wad")
+        z64 = self.rom("n64/Mario Kart 64.z64", n64_rom())
+        det = L.detect_system(ctx, wad)
+        self.assertEqual((det.system, det.method, det.warnings), ("n64vc", "chemin", []))
+        res = L.build_command(ctx, ctx.systems["n64vc"], wad)
+        self.assertEqual(res.command, "%s -b -e %s" % (os.path.join(self.bin, "dolphin-emu"), L.es_escape(wad)))
+        det = L.detect_system(ctx, z64)
+        self.assertEqual((det.system, det.warnings), ("n64", []))
+        self.assertIn("mupen64plus_next", L.build_command(ctx, ctx.systems["n64"], z64).command)
+
     def test_resources_override_in_data_dir(self):
         d = os.path.join(self.esde, "resources", "systems", L.SYSTEMS_DIR)
         os.makedirs(d)
