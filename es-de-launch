@@ -19,7 +19,6 @@ Optionnel : python-magic, ou la commande `file`, pour la détection MIME.
 import argparse
 import configparser
 import datetime
-import fcntl
 import glob
 import hashlib
 import json
@@ -2228,18 +2227,12 @@ def game_name(gl_game, rom):
 def launch(ctx, args, system, rom, det, res):
     cache = ctx.conf.cache_dir
     os.makedirs(cache, exist_ok=True)
-    lock_fh = open(os.path.join(cache, "lock"), "w")
-    try:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        lock_fh.close()
-        raise LaunchError("un autre lancement est en cours (verrou %s)" % os.path.join(cache, "lock"))
+    # Pas de verrou : ES-DE n'empêche pas deux lancements simultanés.
 
     if res.cwd and not os.path.isdir(res.cwd):
         try:
             os.makedirs(res.cwd)  # ES-DE crée le dossier de %STARTDIR%
         except OSError as e:
-            lock_fh.close()
             raise LaunchError("impossible de créer %s : %s" % (res.cwd, e), EXIT_EMULATOR)
 
     gl = Gamelist.load(ctx, system)
@@ -2286,7 +2279,6 @@ def launch(ctx, args, system, rom, det, res):
             run_scripts(ctx, "game-end", script_args, env)
         for s, h in old.items():
             signal.signal(s, h)
-        lock_fh.close()
     return rc if rc >= 0 else 128 - rc
 
 

@@ -892,6 +892,25 @@ class TestLaunch(Env):
         self.assertEqual(len(data["scripts"]["start"]), 1)
         self.assertEqual(self.calls_lines(), [])  # rien n'est exécuté
 
+    def test_two_launches_at_once(self):
+        # ES-DE n'a pas de verrou : un 2e lancement pendant le 1er doit fonctionner
+        import subprocess
+        write(os.path.join(self.bin, "retroarch"),
+              '#!/bin/sh\necho "EMU start" >> "%s"\nsleep 2\n' % self.calls, 0o755)
+        rom = self.rom("n64/Other.z64", n64_rom())
+        first = subprocess.Popen([sys.executable, SCRIPT, "--conf", self.conf_path, "--no-scripts", rom],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(100):
+            if "EMU start" in self.calls_lines():
+                break
+            time.sleep(0.05)
+        write(os.path.join(self.bin, "retroarch"), "#!/bin/sh\nexit 0\n", 0o755)
+        code, _o, err = self.run_main("--no-scripts", rom)
+        first.communicate(timeout=10)
+        first.stderr.close() if first.stderr else None
+        self.assertEqual(code, 0, err)
+        self.assertEqual(first.returncode, 0)
+
     def test_sigterm_forwarded_and_game_end_runs(self):
         import signal
         import subprocess

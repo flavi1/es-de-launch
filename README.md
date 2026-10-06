@@ -215,7 +215,6 @@ La clé `scripts` de la conf choisit la politique : `always` (défaut), `auto` (
 | `~/.config/es-de-launch.conf` | Conf du lanceur |
 | `~/.cache/es-de-launch/resources/` | XML extraits de l'AppImage et `manifest.json` |
 | `~/.cache/es-de-launch/last_run.log` | Commande et sortie du dernier émulateur (hors `-v`) |
-| `~/.cache/es-de-launch/lock` | Verrou contre deux lancements simultanés |
 
 Le cache AppImage est refait quand l'exécutable (cible finale des liens symboliques) change de taille ou de date, ou est plus récent que le cache. L'extraction monte l'AppImage (`--appimage-mount`), copie les deux XML, puis arrête son montage, sans toucher à un ES-DE en cours d'exécution. Si le montage échoue, elle se rabat sur `--appimage-extract`.
 
